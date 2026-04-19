@@ -1,3 +1,4 @@
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -456,6 +457,36 @@ def _import_grounding_dino():
     return GroundingDinoForObjectDetection, GroundingDinoProcessor
 
 
+def _post_process_grounding_dino_detections(
+    processor, outputs, input_ids, target_sizes, box_threshold, text_threshold
+):
+    """
+    Hugging Face renamed ``box_threshold`` → ``threshold`` in
+    ``GroundingDinoProcessor.post_process_grounded_object_detection`` at v4.51.
+    Call the processor with whichever kwargs the installed transformers expects.
+    """
+    fn = processor.post_process_grounded_object_detection
+    params = inspect.signature(fn).parameters
+
+    kwargs = {
+        "outputs": outputs,
+        "input_ids": input_ids,
+        "target_sizes": target_sizes,
+        "text_threshold": text_threshold,
+    }
+    if "threshold" in params:
+        kwargs["threshold"] = box_threshold
+    elif "box_threshold" in params:
+        kwargs["box_threshold"] = box_threshold
+    else:
+        raise TypeError(
+            "GroundingDinoProcessor.post_process_grounded_object_detection has no "
+            "'threshold' or 'box_threshold' parameter; upgrade or pin transformers."
+        )
+
+    return fn(**kwargs)
+
+
 def do_grounding_dino_spatial_reward(
     *,
     images,
@@ -535,18 +566,22 @@ def do_grounding_dino_spatial_reward(
 
         width, height = image.size
         target_sizes = torch.tensor([[height, width]], device=device)
-        processed = processor.post_process_grounded_object_detection(
-            outputs=outputs,
-            input_ids=inputs.input_ids,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=target_sizes,
+        processed = _post_process_grounding_dino_detections(
+            processor,
+            outputs,
+            inputs.input_ids,
+            target_sizes,
+            box_threshold,
+            text_threshold,
         )[0]
 
         detections = []
         boxes = processed["boxes"].detach().cpu().numpy()
         scores = processed["scores"].detach().cpu().numpy()
-        labels = processed["labels"]
+        # v4.51+ prefers text_labels; labels may be deprecated / int ids in future.
+        labels = processed.get("text_labels")
+        if labels is None:
+            labels = processed["labels"]
         for box, score, label in zip(boxes, scores, labels):
             x0, y0, x1, y1 = box.tolist()
             cx = (x0 + x1) / 2.0 / width
