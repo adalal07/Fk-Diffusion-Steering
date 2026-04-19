@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import inspect
+import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
 # Added for FK Steering
@@ -257,6 +258,8 @@ class FKDStableDiffusion(
             FK Steering Addition:
             fkd_args (`dict`, *optional*):
                 The arguments to be passed to the FKD class. If not defined, FKD will not be used.
+                If ``guidance_reward_fn`` is ``GroundingDINOSpatial``, you may set ``grounding_overlay_dir`` to a
+                directory; decoded ``x0`` previews at SMC steps are saved there with detector boxes overlaid.
 
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
@@ -496,6 +499,8 @@ class FKDStableDiffusion(
                 **_fkd_kw,
             )
             self._last_fkd = fkd
+            if fkd_args.get("grounding_overlay_dir"):
+                os.makedirs(fkd_args["grounding_overlay_dir"], exist_ok=True)
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -555,6 +560,12 @@ class FKDStableDiffusion(
 
                 # FK Steering Change
                 if fkd_args is not None and fkd_args["use_smc"]:
+                    if fkd_args.get("grounding_overlay_dir"):
+                        fkd_args.setdefault("reward_config", {})
+                        fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
+                            "grounding_overlay_dir"
+                        ]
+                        fkd_args["reward_config"]["debug_sampling_idx"] = i
                     latents, _ = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
                     )

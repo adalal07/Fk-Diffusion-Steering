@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import clip
 import hpsv2
+import os
 import re
 import warnings
 import numpy as np
@@ -45,7 +46,16 @@ def get_reward_function(
         return do_llm_grading(images=images, prompts=prompts, metric_to_chase=metric_to_chase)
     
     elif reward_name == "GroundingDINOSpatial":
-        return do_grounding_dino_spatial_reward(images=images, prompts=prompts, **reward_config)
+        cfg = dict(reward_config or {})
+        debug_overlay_dir = cfg.pop("debug_overlay_dir", None)
+        debug_sampling_idx = cfg.pop("debug_sampling_idx", None)
+        return do_grounding_dino_spatial_reward(
+            images=images,
+            prompts=prompts,
+            debug_overlay_dir=debug_overlay_dir,
+            debug_sampling_idx=debug_sampling_idx,
+            **cfg,
+        )
     
     else:
         raise ValueError(f"Unknown metric: {reward_name}")
@@ -398,6 +408,39 @@ def _assign_subject_object_boxes(subject, obj, detections, relation, spatial_tie
     return best_pair
 
 
+def _save_grounding_overlay_pil(image_pil, detections, out_path, *, title_lines=None):
+    """Draw Grounding DINO boxes (pixel xyxy) on a copy of the image and save."""
+    from PIL import ImageDraw, ImageFont
+
+    img = image_pil.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    for det in detections:
+        box = det.get("box_xyxy")
+        if box is None:
+            continue
+        x0, y0, x1, y1 = box
+        w = int(max(2, min(img.size) * 0.004))
+        draw.rectangle([x0, y0, x1, y1], outline=(0, 255, 80), width=w)
+        label = f"{det.get('label', '?')} {float(det.get('score', 0)):.2f}"[:72]
+        ty = max(0, int(y0) - 14)
+        draw.text((x0 + 1, ty + 1), label, fill=(0, 0, 0), font=font)
+        draw.text((x0, ty), label, fill=(255, 255, 0), font=font)
+    if title_lines:
+        y = 4
+        for line in title_lines[:4]:
+            draw.text((4, y), str(line)[:100], fill=(255, 255, 255), font=font)
+            draw.text((5, y + 1), str(line)[:100], fill=(0, 0, 0), font=font)
+            y += 12
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    img.save(out_path)
+
+
 def _import_grounding_dino():
     """
     Lazy import so ImageReward / CLIP / notebook imports work on older transformers.
@@ -432,6 +475,8 @@ def do_grounding_dino_spatial_reward(
     use_paired_box_assignment=True,
     spatial_tiebreak_weight=0.15,
     inventory_aggregate="mean",
+    debug_overlay_dir=None,
+    debug_sampling_idx=None,
 ):
     global REWARDS_DICT
 
@@ -511,6 +556,7 @@ def do_grounding_dino_spatial_reward(
                     "label": str(label),
                     "score": float(score),
                     "center": (float(cx), float(cy)),
+                    "box_xyxy": (float(x0), float(y0), float(x1), float(y1)),
                 }
             )
 
@@ -570,6 +616,23 @@ def do_grounding_dino_spatial_reward(
             + object_count_weight * object_count_component
         )
         rewards.append(final_reward)
+
+        if debug_overlay_dir is not None and debug_sampling_idx is not None:
+            rtag = f"{final_reward:+.5f}".replace("+", "p").replace("-", "m")
+            out_path = os.path.join(
+                debug_overlay_dir,
+                f"step_{int(debug_sampling_idx):04d}_particle_{i:02d}_r{rtag}.png",
+            )
+            _save_grounding_overlay_pil(
+                image,
+                detections,
+                out_path,
+                title_lines=[
+                    f"sampling_idx={debug_sampling_idx} particle={i}",
+                    f"reward={final_reward:.5f} (rel={relation_component:.3f} inv={object_count_component:.3f})",
+                    prompts[i][:90],
+                ],
+            )
 
     if warn_no_relation and skipped_no_relation:
         warnings.warn(
