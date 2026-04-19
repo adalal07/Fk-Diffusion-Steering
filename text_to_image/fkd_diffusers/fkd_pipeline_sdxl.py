@@ -696,11 +696,14 @@ class FKDStableDiffusionXL(
             return torch.tensor(rewards).to(x.device)
 
         print('Args:', fkd_args)
+        fkd = None
         if fkd_args is not None and fkd_args['use_smc']:
             _fkd_kw = dict(fkd_args)
             _fkd_kw["device"] = (
                 device if isinstance(device, torch.device) else torch.device(device)
             )
+            if _fkd_kw.get("record_reward_history") and _fkd_kw.get("reward_history") is None:
+                _fkd_kw["reward_history"] = []
             fkd = FKD(
                 latent_to_decode_fn=lambda x: latent_to_decode(
                     model=self, output_type=output_type, latents=x
@@ -708,6 +711,7 @@ class FKDStableDiffusionXL(
                 reward_fn=postprocess_and_apply_reward_fn,
                 **_fkd_kw,
             )
+            self._last_fkd = fkd
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):

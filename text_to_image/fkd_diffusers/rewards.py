@@ -51,13 +51,30 @@ def get_reward_function(
         raise ValueError(f"Unknown metric: {reward_name}")
 
 
+RELATION_PATTERN_SPECS = {
+    # Handles:
+    # - "a dog right of a cat" / "dog to the right of a cat"
+    # - "the cat is to the left of the dog and fish"  (object side splits on and)
+    # - "the dog and the cat are to the left of the fish" (subject side splits on and)
+    "left_of": [
+        r"(?P<subject>.+?)\s+(?:(?:is|are)\s+)?(?:to\s+the\s+)?left of\s+(?P<object>.+)",
+        r"(?P<subject>.+?)\s+(?:is\s+)?on\s+the\s+left\s+side\s+of\s+(?P<object>.+)",
+    ],
+    "right_of": [
+        r"(?P<subject>.+?)\s+(?:(?:is|are)\s+)?(?:to\s+the\s+)?right of\s+(?P<object>.+)",
+        r"(?P<subject>.+?)\s+(?:is\s+)?on\s+the\s+right\s+side\s+of\s+(?P<object>.+)",
+    ],
+    "on_top_of": [
+        r"(?P<subject>.+?)\s+(?:(?:is|are)\s+)?(?:on top of|above|over)\s+(?P<object>.+)",
+    ],
+    "below": [
+        r"(?P<subject>.+?)\s+(?:(?:is|are)\s+)?(?:below|under|underneath)\s+(?P<object>.+)",
+    ],
+}
+
 RELATION_PATTERNS = {
-    "left_of": re.compile(r"(.+?)\s+(?:is\s+)?left of\s+(.+)", re.IGNORECASE),
-    "right_of": re.compile(r"(.+?)\s+(?:is\s+)?right of\s+(.+)", re.IGNORECASE),
-    "on_top_of": re.compile(
-        r"(.+?)\s+(?:is\s+)?(?:on top of|above|over)\s+(.+)", re.IGNORECASE
-    ),
-    "below": re.compile(r"(.+?)\s+(?:is\s+)?(?:below|under)\s+(.+)", re.IGNORECASE),
+    rel: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+    for rel, patterns in RELATION_PATTERN_SPECS.items()
 }
 
 NUMBER_WORD_TO_INT = {
@@ -76,29 +93,103 @@ NUMBER_WORD_TO_INT = {
 
 
 def _clean_entity(text):
+    text = re.sub(r"\([^)]*\)", " ", text)  # remove parenthetical asides
     return (
         text.lower()
+        .replace(";", " ")
+        .replace(":", " ")
         .replace(",", " ")
         .replace(".", " ")
+        .replace("!", " ")
+        .replace("?", " ")
+        .replace("-", " ")
         .replace("the ", " ")
         .replace("a ", " ")
         .replace("an ", " ")
+        .replace("  ", " ")
         .strip()
     )
 
 
-def _extract_relations_from_prompt(prompt):
-    prompt_l = prompt.lower()
+def _strip_trailing_clause(text):
+    # Drop trailing metadata (do NOT split on "and" — needed for "dog and fish").
+    splitter = re.split(
+        r"\b(with|using|featuring|while|but|in\s+the\s+background)\b|,|;|\.|!|\?",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )
+    return splitter[0].strip()
+
+
+# Split coordinate lists: "the dog and fish", "cat, dog", "a or b"
+_CONJUNCTION_SPLIT = re.compile(
+    r"\s*,\s*|\s+and\s+|\s+or\s+|\s*&\s*",
+    re.IGNORECASE,
+)
+
+
+def _split_entity_phrase(phrase):
+    """
+    Turn a phrase into one or more entity strings, e.g.
+    "the dog and fish" -> ["dog", "fish"], "a cat" -> ["cat"].
+    """
+    phrase = _strip_trailing_clause(phrase.strip())
+    if not phrase:
+        return []
+    parts = _CONJUNCTION_SPLIT.split(phrase)
+    out = []
+    for p in parts:
+        c = _clean_entity(p)
+        if c:
+            out.append(c)
+    if not out:
+        c = _clean_entity(phrase)
+        return [c] if c else []
+    return out
+
+
+def _expand_pairwise_relations(subject_raw, object_raw, relation):
+    """
+    Base pattern is (subject phrase) RELATION (object phrase).
+    Each side may list several objects joined by and/or/comma; we take the
+    Cartesian product of subject-side entities × object-side entities
+    (excluding trivial s==o).
+    """
+    subs = _split_entity_phrase(subject_raw)
+    objs = _split_entity_phrase(object_raw)
     relations = []
-    for relation, pattern in RELATION_PATTERNS.items():
-        match = pattern.search(prompt_l)
-        if not match:
-            continue
-        subject = _clean_entity(match.group(1))
-        obj = _clean_entity(match.group(2))
-        if subject and obj:
-            relations.append({"subject": subject, "object": obj, "relation": relation})
+    for s in subs:
+        for o in objs:
+            if s and o and s != o:
+                relations.append(
+                    {"subject": s, "object": o, "relation": relation}
+                )
     return relations
+
+
+def _extract_relations_from_prompt(prompt):
+    prompt_l = " ".join(prompt.lower().strip().split())
+    relations = []
+    for relation, patterns in RELATION_PATTERNS.items():
+        for pattern in patterns:
+            for match in pattern.finditer(prompt_l):
+                subject_raw = match.group("subject")
+                object_raw = match.group("object")
+                relations.extend(
+                    _expand_pairwise_relations(subject_raw, object_raw, relation)
+                )
+
+    # Deduplicate while preserving order.
+    deduped = []
+    seen = set()
+    for rel in relations:
+        key = (rel["subject"], rel["relation"], rel["object"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(rel)
+    return deduped
 
 
 def _score_relation(dx, dy, relation, align_scale=6.0):
@@ -127,12 +218,23 @@ def _build_detection_prompt(objects):
     return ". ".join(unique_objects) + "."
 
 
+def _label_matches_entity_word(label, entity):
+    """Avoid false positives like 'cat' matching 'catalog'."""
+    label = label.lower().strip()
+    entity = entity.lower().strip()
+    if not entity:
+        return False
+    if label == entity:
+        return True
+    return re.search(rf"(?<!\w){re.escape(entity)}(?!\w)", label) is not None
+
+
 def _count_matching_detections(detections, obj_name):
     obj = obj_name.lower().strip()
     count = 0
     for det in detections:
         label = det["label"].lower().strip()
-        if obj in label or label in obj:
+        if _label_matches_entity_word(label, obj):
             count += 1
     return count
 
@@ -193,22 +295,107 @@ def _extract_expected_object_counts(prompt, objects, bare_plural_default_count=2
     return expected
 
 
-def _score_object_count(observed_count, expected_count):
-    # Incremental toward expected count and penalizes over/under counts symmetrically.
+def _score_object_count_inventory(observed_count, expected_count):
+    """
+    Count consistency reward in [0, 1].
+
+    - Missing (obs=0, exp>=1): 0 — strong penalty for absent required entities.
+    - Under-count (obs < exp): linear partial credit obs / exp.
+    - Exact match: 1.
+    - Over-count (obs > exp): exp / obs — e.g. 6 birds vs 1 expected -> 1/6.
+
+    This penalizes "too many birds" much more sharply than symmetric |obs-exp|/exp.
+    """
     if expected_count <= 0:
         return 1.0 if observed_count == 0 else 0.0
-    return max(0.0, 1.0 - abs(observed_count - expected_count) / expected_count)
+    if observed_count <= 0:
+        return 0.0
+    if observed_count <= expected_count:
+        return float(observed_count) / float(expected_count)
+    return float(expected_count) / float(observed_count)
+
+
+def _entity_match_score(det, entity):
+    """Higher is better; uses detector confidence × label match strength."""
+    label = det["label"].lower().strip()
+    entity = entity.lower().strip()
+    conf = float(det["score"])
+    if not entity:
+        return 0.0
+    if label == entity:
+        return conf * 1.0
+    if _label_matches_entity_word(label, entity):
+        return conf * 1.0
+    if entity in label:
+        return conf * 0.55
+    return 0.0
 
 
 def _match_best_box(detections, obj_name):
-    obj = obj_name.lower().strip()
+    """Pick single best box for one entity (legacy / fallback)."""
     best = None
+    best_s = -1.0
     for det in detections:
-        label = det["label"].lower().strip()
-        if obj in label or label in obj:
-            if best is None or det["score"] > best["score"]:
-                best = det
+        s = _entity_match_score(det, obj_name)
+        if s > best_s:
+            best_s = s
+            best = det
     return best
+
+
+def _spatial_tiebreak_bonus_full(dx, dy, relation):
+    if relation == "left_of":
+        return 1.0 if dx < 0 else 0.0
+    if relation == "right_of":
+        return 1.0 if dx > 0 else 0.0
+    if relation == "on_top_of":
+        return 1.0 if dy > 0 else 0.0
+    if relation == "below":
+        return 1.0 if dy < 0 else 0.0
+    return 0.0
+
+
+def _assign_subject_object_boxes(subject, obj, detections, relation, spatial_tiebreak_weight):
+    """
+    Assign two *distinct* detections to (subject, object) roles.
+
+    Independent per-entity argmax can pick the same box twice or swap identities
+    when labels are noisy; we score all ordered pairs and take the best.
+    """
+    if len(detections) == 0:
+        return None, None
+    if len(detections) == 1:
+        # Cannot assign two roles to one box without ambiguity.
+        return _match_best_box(detections, subject), None
+
+    best_pair = (None, None)
+    best_total = -1.0
+    n = len(detections)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d_sub, d_obj = detections[i], detections[j]
+            label_total = _entity_match_score(d_sub, subject) + _entity_match_score(
+                d_obj, obj
+            )
+            cx_sub = d_sub["center"][0]
+            cx_obj = d_obj["center"][0]
+            cy_sub = d_sub["center"][1]
+            cy_obj = d_obj["center"][1]
+            dx = cx_sub - cx_obj
+            dy = cy_sub - cy_obj
+            geom = _spatial_tiebreak_bonus_full(dx, dy, relation)
+            total = label_total + spatial_tiebreak_weight * geom
+            if total > best_total:
+                best_total = total
+                best_pair = (d_sub, d_obj)
+
+    # No confident label-to-box association for this pair of roles.
+    if best_total < 0.05:
+        return None, None
+
+    return best_pair
 
 
 def _import_grounding_dino():
@@ -239,11 +426,19 @@ def do_grounding_dino_spatial_reward(
     no_relation_score=0.0,
     warn_no_relation=True,
     expected_object_counts=None,
-    relation_weight=0.7,
-    object_count_weight=0.3,
+    relation_weight=0.55,
+    object_count_weight=0.45,
     bare_plural_default_count=2,
+    use_paired_box_assignment=True,
+    spatial_tiebreak_weight=0.15,
+    inventory_aggregate="mean",
 ):
     global REWARDS_DICT
+
+    if inventory_aggregate not in ("mean", "min"):
+        raise ValueError(
+            "inventory_aggregate must be 'mean' or 'min' (min = strict: one bad entity tanks inventory)."
+        )
 
     if REWARDS_DICT["GroundingDINOSpatial"] is None:
         GroundingDinoForObjectDetection, GroundingDinoProcessor = _import_grounding_dino()
@@ -325,8 +520,17 @@ def do_grounding_dino_spatial_reward(
             obj = _clean_entity(rel["object"])
             relation = rel["relation"]
 
-            subject_det = _match_best_box(detections, subject)
-            object_det = _match_best_box(detections, obj)
+            if use_paired_box_assignment:
+                subject_det, object_det = _assign_subject_object_boxes(
+                    subject,
+                    obj,
+                    detections,
+                    relation,
+                    spatial_tiebreak_weight,
+                )
+            else:
+                subject_det = _match_best_box(detections, subject)
+                object_det = _match_best_box(detections, obj)
             if subject_det is None or object_det is None:
                 relation_scores.append(missing_box_penalty)
                 continue
@@ -349,12 +553,18 @@ def do_grounding_dino_spatial_reward(
         object_count_scores = []
         for obj_name, exp_count in expected_counts.items():
             obs_count = _count_matching_detections(detections, obj_name)
-            object_count_scores.append(_score_object_count(obs_count, exp_count))
+            object_count_scores.append(
+                _score_object_count_inventory(obs_count, exp_count)
+            )
 
         relation_component = float(np.mean(relation_scores)) if relation_scores else 0.0
-        object_count_component = (
-            float(np.mean(object_count_scores)) if object_count_scores else 0.0
-        )
+        if object_count_scores:
+            if inventory_aggregate == "min":
+                object_count_component = float(min(object_count_scores))
+            else:
+                object_count_component = float(np.mean(object_count_scores))
+        else:
+            object_count_component = 0.0
         final_reward = (
             relation_weight * relation_component
             + object_count_weight * object_count_component

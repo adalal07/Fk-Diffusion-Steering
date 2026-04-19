@@ -1,6 +1,8 @@
 """
 Utility functions for the FKD pipeline.
 """
+import warnings
+
 import torch
 from diffusers import DDIMScheduler
 
@@ -136,3 +138,76 @@ def do_eval(*, prompt, images, metrics_to_compute, reward_config=None):
             raise ValueError(f"Unknown metric: {metric}")
 
     return results
+
+
+def plot_fkd_reward_trace(
+    reward_history,
+    *,
+    title="FK steering reward vs diffusion step index",
+    save_path=None,
+    show_particles=True,
+    show_mean_band=True,
+    figsize=(9, 4),
+    ax=None,
+):
+    """
+    Plot reward_fn values recorded during SMC / FK steering (see fkd_args['record_reward_history']).
+
+    X-axis: ``sampling_idx`` — the denoising loop index ``i`` (0 … num_inference_steps-1).
+    Rewards are only computed at resampling steps (see ``resample_frequency`` / ``resampling_t_*``),
+    so the plot shows points only where the steering actually evaluated the reward.
+
+    Parameters
+    ----------
+    reward_history : list[dict] | None
+        From ``fkd_args['reward_history']`` or ``pipeline._last_fkd.reward_history`` after a run.
+    show_particles : bool
+        If True, one line per particle (same prompt, different SMC particles).
+    show_mean_band : bool
+        Plot mean reward across particles and optional min/max band.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "plot_fkd_reward_trace requires matplotlib. pip install matplotlib"
+        ) from e
+
+    if not reward_history:
+        warnings.warn("plot_fkd_reward_trace: empty reward_history; nothing to plot.")
+        return None
+
+    xs = [h["sampling_idx"] for h in reward_history]
+    created_fig = ax is None
+    if created_fig:
+        _, ax = plt.subplots(figsize=figsize)
+
+    if show_particles:
+        n_particles = len(reward_history[0]["rewards"])
+        for p in range(n_particles):
+            ys = [h["rewards"][p] for h in reward_history]
+            ax.plot(xs, ys, alpha=0.45, linewidth=1.0, label=f"particle {p}")
+
+    if show_mean_band:
+        means = [h["mean"] for h in reward_history]
+        ax.plot(xs, means, color="black", linewidth=2.0, label="mean")
+        mins = [h["min"] for h in reward_history]
+        maxs = [h["max"] for h in reward_history]
+        ax.fill_between(xs, mins, maxs, color="gray", alpha=0.2, label="min–max")
+
+    ax.set_xlabel("Diffusion step index (sampling_idx)")
+    ax.set_ylabel("Reward")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+
+    if created_fig:
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        return ax.figure
+    if save_path:
+        warnings.warn(
+            "save_path was set but ax was provided; save the figure from the Figure object instead."
+        )
+    return None

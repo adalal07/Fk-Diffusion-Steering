@@ -5,7 +5,7 @@ Feynman-Kac Diffusion (FKD) steering mechanism implementation.
 import torch
 from enum import Enum
 import numpy as np
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 import logging
 
 
@@ -51,6 +51,8 @@ class FKD:
         reward_min_value: float = 0.0,
         latent_to_decode_fn: Callable[[torch.Tensor], torch.Tensor] = lambda x: x,
         device: torch.device = torch.device('cuda'),
+        record_reward_history: bool = False,
+        reward_history: Optional[List[dict]] = None,
         **kwargs,
     ) -> None:
         # Initialize hyperparameters and functions
@@ -83,6 +85,13 @@ class FKD:
             self.num_particles, device=self.device
         )
 
+        # Optional trace of reward_fn outputs at each resampling step (for debugging).
+        self.record_reward_history = record_reward_history
+        if record_reward_history:
+            self.reward_history = reward_history if reward_history is not None else []
+        else:
+            self.reward_history = None
+
     def resample(
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -112,6 +121,23 @@ class FKD:
         rs_candidates = self.reward_fn(population_images)
         if isinstance(rs_candidates, torch.Tensor):
             rs_candidates = rs_candidates.to(self.device)
+
+        if self.reward_history is not None:
+            rs_cpu = rs_candidates.detach().float().cpu()
+            self.reward_history.append(
+                {
+                    "sampling_idx": int(sampling_idx),
+                    "rewards": rs_cpu.tolist(),
+                    "mean": float(rs_cpu.mean().item()),
+                    "std": float(
+                        rs_cpu.std(unbiased=False).item()
+                        if rs_cpu.numel() > 1
+                        else 0.0
+                    ),
+                    "max": float(rs_cpu.max().item()),
+                    "min": float(rs_cpu.min().item()),
+                }
+            )
 
         # Compute importance weights
         if self.potential_type == PotentialType.MAX:
