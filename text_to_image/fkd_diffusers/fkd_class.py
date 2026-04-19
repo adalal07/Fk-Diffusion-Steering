@@ -71,13 +71,17 @@ class FKD:
         self.latent_to_decode_fn = latent_to_decode_fn
 
         # Initialize device and population reward state
-        self.device = device
+        self.device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
 
         # initial rewards
         self.population_rs = (
             torch.ones(self.num_particles, device=self.device) * reward_min_value
         )
-        self.product_of_potentials = torch.ones(self.num_particles).to(self.device)
+        self.product_of_potentials = torch.ones(
+            self.num_particles, device=self.device
+        )
 
     def resample(
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
@@ -106,6 +110,8 @@ class FKD:
         # Decode latents to population images and compute rewards
         population_images = self.latent_to_decode_fn(x0_preds)
         rs_candidates = self.reward_fn(population_images)
+        if isinstance(rs_candidates, torch.Tensor):
+            rs_candidates = rs_candidates.to(self.device)
 
         # Compute importance weights
         if self.potential_type == PotentialType.MAX:

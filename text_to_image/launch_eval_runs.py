@@ -131,6 +131,7 @@ def main(args):
         prompt=["test"],
         images=[Image.new("RGB", (224, 224))],
         metrics_to_compute=metrics_to_compute,
+        reward_config=args.reward_config,
     )
 
     metrics_arr = {
@@ -161,6 +162,7 @@ def main(args):
             resampling_t_end=args.resample_t_end,
             guidance_reward_fn=args.guidance_reward_fn,
             potential_type=args.potential_type,
+            reward_config=args.reward_config,
         )
 
         images = pipe(
@@ -174,7 +176,10 @@ def main(args):
             end_time = datetime.now()
 
         results = do_eval(
-            prompt=prompt, images=images, metrics_to_compute=metrics_to_compute
+            prompt=prompt,
+            images=images,
+            metrics_to_compute=metrics_to_compute,
+            reward_config=args.reward_config,
         )
         if not args.use_smc:
             end_time = datetime.now()
@@ -274,12 +279,31 @@ def get_args():
     parser.add_argument("--resample_t_start", type=int, default=5)
     parser.add_argument("--resample_t_end", type=int, default=30)
     parser.add_argument("--potential_type", type=str, default="diff")
+    parser.add_argument(
+        "--reward_kwargs_json",
+        type=str,
+        default=None,
+        help="Optional JSON object with kwargs for guidance reward function.",
+    )
+    parser.add_argument(
+        "--reward_config_json",
+        type=str,
+        default=None,
+        help="Optional JSON object for fkd_args['reward_config'] (preferred).",
+    )
 
     args = parser.parse_args()
     print(args.adaptive_resampling)
 
     if args.prompt_path == "geneval_metadata.jsonl":
         args.save_individual_images = True
+
+    args.reward_config = {}
+    if args.reward_config_json:
+        args.reward_config = json.loads(args.reward_config_json)
+    elif args.reward_kwargs_json:
+        # Backward compatibility with older CLI flag.
+        args.reward_config = json.loads(args.reward_kwargs_json)
 
     if args.model_idx % 4 == 0:
         args.num_particles = 2

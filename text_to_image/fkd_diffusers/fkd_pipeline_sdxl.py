@@ -689,19 +689,24 @@ class FKDStableDiffusionXL(
                 fkd_args["guidance_reward_fn"], 
                 images=imagesx, 
                 prompts=prompt, 
-                metric_to_chase=fkd_args.get("metric_to_chase", None)
+                metric_to_chase=fkd_args.get("metric_to_chase", None),
+                reward_config=fkd_args.get("reward_config", fkd_args.get("reward_kwargs", None)),
             )
 
             return torch.tensor(rewards).to(x.device)
 
         print('Args:', fkd_args)
         if fkd_args is not None and fkd_args['use_smc']:
+            _fkd_kw = dict(fkd_args)
+            _fkd_kw["device"] = (
+                device if isinstance(device, torch.device) else torch.device(device)
+            )
             fkd = FKD(
                 latent_to_decode_fn=lambda x: latent_to_decode(
                     model=self, output_type=output_type, latents=x
                 ),
                 reward_fn=postprocess_and_apply_reward_fn,
-                **fkd_args,
+                **_fkd_kw,
             )
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
