@@ -224,6 +224,107 @@ def _score_relation(dx, dy, relation, align_scale=6.0):
     return float((directional * orthogonal).item())
 
 
+def _gaussian_relation_score(dx, dy, relation, sigma=0.3):
+    """
+    Gaussian spatial score around relation-specific target offsets.
+    Inputs are normalized center deltas in [-1, 1].
+    """
+    if sigma <= 0:
+        sigma = 1e-3
+    if relation == "left_of":
+        primary = float(dx)
+        primary_target = -0.35
+        orthogonal = float(dy)
+        good_side = primary <= primary_target
+    elif relation == "right_of":
+        primary = float(dx)
+        primary_target = 0.35
+        orthogonal = float(dy)
+        good_side = primary >= primary_target
+    elif relation == "on_top_of":
+        primary = float(dy)
+        primary_target = 0.35
+        orthogonal = float(dx)
+        good_side = primary >= primary_target
+    elif relation == "below":
+        primary = float(dy)
+        primary_target = -0.35
+        orthogonal = float(dx)
+        good_side = primary <= primary_target
+    else:
+        raise ValueError(f"Unsupported spatial relation: {relation}")
+    # Half-Gaussian on the directional axis:
+    # keep a flat plateau (1.0) once clearly on the correct side.
+    if good_side:
+        directional = 1.0
+    else:
+        directional = float(
+            np.exp(-((primary - primary_target) ** 2) / (2.0 * float(sigma) ** 2))
+        )
+    # Still softly prefer limited orthogonal displacement.
+    ortho_sigma = float(sigma) * 1.5
+    orth_score = float(
+        np.exp(-(orthogonal**2) / (2.0 * max(ortho_sigma, 1e-3) ** 2))
+    )
+    return directional * orth_score
+
+
+def _stage_weighting(
+    base_relation_weight,
+    base_object_count_weight,
+    *,
+    sampling_idx=None,
+    total_time_steps=None,
+    transition_progress=0.5,
+    sharpness=12.0,
+    early_object_phase_fraction=0.3,
+    early_object_boost=2.5,
+):
+    """
+    Early denoising: object inventory dominates.
+    Later denoising: relation alignment dominates.
+    """
+    if sampling_idx is None or total_time_steps is None or total_time_steps <= 1:
+        return float(base_relation_weight), float(base_object_count_weight)
+    progress = float(sampling_idx) / float(max(int(total_time_steps) - 1, 1))
+    # Smooth switch around transition_progress.
+    relation_gate = 1.0 / (1.0 + np.exp(-float(sharpness) * (progress - float(transition_progress))))
+    object_gate = 1.0 - relation_gate
+    wr = max(0.0, float(base_relation_weight) * relation_gate)
+    wo = max(0.0, float(base_object_count_weight) * object_gate)
+    if progress <= float(early_object_phase_fraction):
+        wo *= float(max(early_object_boost, 1.0))
+    norm = wr + wo
+    if norm <= 1e-8:
+        return 0.5, 0.5
+    return wr / norm, wo / norm
+
+
+def _soft_entity_presence(detections, entity):
+    """
+    Continuous object presence proxy from low-threshold detections.
+    Uses max entity-match score in [0,1]-ish instead of hard existence.
+    """
+    if not detections:
+        return 0.0
+    best = 0.0
+    for det in detections:
+        best = max(best, float(_entity_match_score(det, entity)))
+    return float(np.clip(best, 0.0, 1.0))
+
+
+def _soft_entity_count(detections, entity):
+    """
+    Continuous count estimate from low-threshold candidates.
+    """
+    if not detections:
+        return 0.0
+    total = 0.0
+    for det in detections:
+        total += float(_entity_match_score(det, entity))
+    return float(max(total, 0.0))
+
+
 def _build_detection_prompt(objects):
     unique_objects = sorted(set(objects))
     return ". ".join(unique_objects) + "."
@@ -311,19 +412,21 @@ def _score_object_count_inventory(observed_count, expected_count):
     Count consistency reward in [0, 1].
 
     - Missing (obs=0, exp>=1): 0 — strong penalty for absent required entities.
-    - Under-count (obs < exp): linear partial credit obs / exp.
+    - Under-count (obs < exp): quadratic partial credit (obs/exp)^2.
     - Exact match: 1.
-    - Over-count (obs > exp): exp / obs — e.g. 6 birds vs 1 expected -> 1/6.
-
-    This penalizes "too many birds" much more sharply than symmetric |obs-exp|/exp.
+    - Over-count (obs > exp): 0.9 ("at least" semantics; slightly below exact).
     """
     if expected_count <= 0:
-        return 1.0 if observed_count == 0 else 0.0
+        return 1.0 if observed_count <= 0 else 0.9
     if observed_count <= 0:
         return 0.0
-    if observed_count <= expected_count:
-        return float(observed_count) / float(expected_count)
-    return float(expected_count) / float(observed_count)
+    if observed_count == expected_count:
+        return 1.0
+    if observed_count > expected_count:
+        return 0.9
+    if observed_count < expected_count:
+        return float(observed_count / expected_count) ** 2
+    return 0.0
 
 
 def _entity_match_score(det, entity):
@@ -366,7 +469,18 @@ def _spatial_tiebreak_bonus_full(dx, dy, relation):
     return 0.0
 
 
-def _assign_subject_object_boxes(subject, obj, detections, relation, spatial_tiebreak_weight):
+def _assign_subject_object_boxes(
+    subject,
+    obj,
+    detections,
+    relation,
+    spatial_tiebreak_weight,
+    min_pair_confidence=0.05,
+    prev_subject_center=None,
+    prev_object_center=None,
+    temporal_tiebreak_weight=0.0,
+    temporal_sigma=0.08,
+):
     """
     Assign two *distinct* detections to (subject, object) roles.
 
@@ -398,12 +512,29 @@ def _assign_subject_object_boxes(subject, obj, detections, relation, spatial_tie
             dy = cy_sub - cy_obj
             geom = _spatial_tiebreak_bonus_full(dx, dy, relation)
             total = label_total + spatial_tiebreak_weight * geom
+            if (
+                prev_subject_center is not None
+                and prev_object_center is not None
+                and temporal_tiebreak_weight > 0.0
+            ):
+                if temporal_sigma <= 0:
+                    temporal_sigma = 1e-3
+                sub_d2 = (cx_sub - prev_subject_center[0]) ** 2 + (
+                    cy_sub - prev_subject_center[1]
+                ) ** 2
+                obj_d2 = (cx_obj - prev_object_center[0]) ** 2 + (
+                    cy_obj - prev_object_center[1]
+                ) ** 2
+                temporal_bonus = np.exp(
+                    -(sub_d2 + obj_d2) / (2.0 * float(temporal_sigma) ** 2)
+                )
+                total += float(temporal_tiebreak_weight) * float(temporal_bonus)
             if total > best_total:
                 best_total = total
                 best_pair = (d_sub, d_obj)
 
     # No confident label-to-box association for this pair of roles.
-    if best_total < 0.05:
+    if best_total < float(min_pair_confidence):
         return None, None
 
     return best_pair
@@ -493,7 +624,7 @@ def do_grounding_dino_spatial_reward(
     prompts,
     spatial_relations=None,
     grounding_model_name="IDEA-Research/grounding-dino-base",
-    box_threshold=0.25,
+    box_threshold=0.05,
     text_threshold=0.25,
     align_scale=6.0,
     missing_box_penalty=-1.0,
@@ -505,9 +636,30 @@ def do_grounding_dino_spatial_reward(
     bare_plural_default_count=2,
     use_paired_box_assignment=True,
     spatial_tiebreak_weight=0.15,
-    inventory_aggregate="mean",
+    inventory_aggregate="min",
     debug_overlay_dir=None,
     debug_sampling_idx=None,
+    debug_time_steps=None,
+    use_soft_detections=True,
+    soft_box_threshold=0.05,
+    use_step_box_threshold_schedule=True,
+    steering_phase_start_ratio=0.2,
+    steering_phase_end_ratio=0.4,
+    steering_phase_box_threshold=0.05,
+    soft_missing_box_penalty=-0.2,
+    use_max_entity_presence=True,
+    dynamic_stage_weighting=True,
+    stage_transition_progress=0.6,
+    stage_sharpness=12.0,
+    stage_early_object_fraction=0.45,
+    stage_early_object_boost=3.5,
+    relation_scoring_mode="gaussian",
+    relation_gaussian_sigma=0.3,
+    relation_targets=None,
+    temporal_state=None,
+    temporal_consistency_weight=0.3,
+    temporal_tiebreak_weight=0.25,
+    temporal_sigma=0.08,
 ):
     global REWARDS_DICT
 
@@ -566,12 +718,26 @@ def do_grounding_dino_spatial_reward(
 
         width, height = image.size
         target_sizes = torch.tensor([[height, width]], device=device)
+        eff_box_threshold = float(box_threshold)
+        if (
+            use_step_box_threshold_schedule
+            and debug_sampling_idx is not None
+            and debug_time_steps is not None
+            and int(debug_time_steps) > 1
+        ):
+            progress = float(debug_sampling_idx) / float(max(int(debug_time_steps) - 1, 1))
+            if float(steering_phase_start_ratio) <= progress <= float(steering_phase_end_ratio):
+                eff_box_threshold = min(
+                    float(eff_box_threshold), float(steering_phase_box_threshold)
+                )
+        if use_soft_detections:
+            eff_box_threshold = min(float(eff_box_threshold), float(soft_box_threshold))
         processed = _post_process_grounding_dino_detections(
             processor,
             outputs,
             inputs.input_ids,
             target_sizes,
-            box_threshold,
+            eff_box_threshold,
             text_threshold,
         )[0]
 
@@ -596,10 +762,20 @@ def do_grounding_dino_spatial_reward(
             )
 
         relation_scores = []
+        relation_metas = []
         for rel in prompt_relations:
             subject = _clean_entity(rel["subject"])
             obj = _clean_entity(rel["object"])
             relation = rel["relation"]
+            prev_subject_center = None
+            prev_object_center = None
+            rel_key = None
+            if temporal_state is not None:
+                rel_key = f"{i}|{subject}|{relation}|{obj}"
+                prev = temporal_state.get(rel_key)
+                if prev is not None:
+                    prev_subject_center = prev.get("subject_center")
+                    prev_object_center = prev.get("object_center")
 
             if use_paired_box_assignment:
                 subject_det, object_det = _assign_subject_object_boxes(
@@ -608,19 +784,92 @@ def do_grounding_dino_spatial_reward(
                     detections,
                     relation,
                     spatial_tiebreak_weight,
+                    min_pair_confidence=(0.0 if use_soft_detections else 0.05),
+                    prev_subject_center=prev_subject_center,
+                    prev_object_center=prev_object_center,
+                    temporal_tiebreak_weight=temporal_tiebreak_weight,
+                    temporal_sigma=temporal_sigma,
                 )
             else:
                 subject_det = _match_best_box(detections, subject)
                 object_det = _match_best_box(detections, obj)
             if subject_det is None or object_det is None:
-                relation_scores.append(missing_box_penalty)
+                if use_soft_detections:
+                    s_presence = _soft_entity_presence(detections, subject)
+                    o_presence = _soft_entity_presence(detections, obj)
+                    pair_presence = min(s_presence, o_presence)
+                    soft_rel = float(soft_missing_box_penalty) * (1.0 - pair_presence)
+                    relation_scores.append(soft_rel)
+                else:
+                    relation_scores.append(missing_box_penalty)
                 continue
 
             dx = subject_det["center"][0] - object_det["center"][0]
             dy = subject_det["center"][1] - object_det["center"][1]
-            relation_scores.append(
-                _score_relation(dx=torch.tensor(dx), dy=torch.tensor(dy), relation=relation, align_scale=align_scale)
-            )
+            if relation_scoring_mode == "gaussian":
+                rel_score = _gaussian_relation_score(
+                    dx=dx, dy=dy, relation=relation, sigma=relation_gaussian_sigma
+                )
+            else:
+                rel_score = _score_relation(
+                    dx=torch.tensor(dx),
+                    dy=torch.tensor(dy),
+                    relation=relation,
+                    align_scale=align_scale,
+                )
+
+            if relation_targets is not None:
+                target = relation_targets.get(relation) if isinstance(relation_targets, dict) else None
+                if target is not None:
+                    tx = float(target.get("dx_target", 0.0))
+                    ty = float(target.get("dy_target", 0.0))
+                    ts = float(target.get("sigma", relation_gaussian_sigma))
+                    ts = max(ts, 1e-3)
+                    # Keep directional plateau semantics with custom targets too.
+                    if relation == "left_of":
+                        directional = 1.0 if float(dx) <= tx else float(
+                            np.exp(-((float(dx) - tx) ** 2) / (2.0 * ts**2))
+                        )
+                        orth = float(np.exp(-((float(dy) - ty) ** 2) / (2.0 * (1.5 * ts) ** 2)))
+                        rel_score = directional * orth
+                    elif relation == "right_of":
+                        directional = 1.0 if float(dx) >= tx else float(
+                            np.exp(-((float(dx) - tx) ** 2) / (2.0 * ts**2))
+                        )
+                        orth = float(np.exp(-((float(dy) - ty) ** 2) / (2.0 * (1.5 * ts) ** 2)))
+                        rel_score = directional * orth
+                    elif relation == "on_top_of":
+                        directional = 1.0 if float(dy) >= ty else float(
+                            np.exp(-((float(dy) - ty) ** 2) / (2.0 * ts**2))
+                        )
+                        orth = float(np.exp(-((float(dx) - tx) ** 2) / (2.0 * (1.5 * ts) ** 2)))
+                        rel_score = directional * orth
+                    elif relation == "below":
+                        directional = 1.0 if float(dy) <= ty else float(
+                            np.exp(-((float(dy) - ty) ** 2) / (2.0 * ts**2))
+                        )
+                        orth = float(np.exp(-((float(dx) - tx) ** 2) / (2.0 * (1.5 * ts) ** 2)))
+                        rel_score = directional * orth
+                    else:
+                        dist2 = (float(dx) - tx) ** 2 + (float(dy) - ty) ** 2
+                        rel_score = float(np.exp(-dist2 / (2.0 * ts**2)))
+
+            temporal_consistency = 1.0
+            if prev_subject_center is not None and prev_object_center is not None:
+                sdist2 = (subject_det["center"][0] - prev_subject_center[0]) ** 2 + (
+                    subject_det["center"][1] - prev_subject_center[1]
+                ) ** 2
+                odist2 = (object_det["center"][0] - prev_object_center[0]) ** 2 + (
+                    object_det["center"][1] - prev_object_center[1]
+                ) ** 2
+                temporal_consistency = float(
+                    np.exp(-(sdist2 + odist2) / (2.0 * max(float(temporal_sigma), 1e-3) ** 2))
+                )
+                rel_score = (1.0 - float(temporal_consistency_weight)) * float(rel_score) + float(
+                    temporal_consistency_weight
+                ) * float(rel_score) * temporal_consistency
+            relation_scores.append(float(rel_score))
+            relation_metas.append((rel_key, subject_det, object_det))
 
         if expected_object_counts is not None and i < len(expected_object_counts):
             expected_counts = {
@@ -633,10 +882,17 @@ def do_grounding_dino_spatial_reward(
 
         object_count_scores = []
         for obj_name, exp_count in expected_counts.items():
-            obs_count = _count_matching_detections(detections, obj_name)
-            object_count_scores.append(
-                _score_object_count_inventory(obs_count, exp_count)
-            )
+            if use_soft_detections and use_max_entity_presence:
+                # Continuous proxy before objects are crisply formed.
+                soft_count = _soft_entity_count(detections, obj_name)
+                object_count_scores.append(
+                    _score_object_count_inventory(soft_count, exp_count)
+                )
+            else:
+                obs_count = _count_matching_detections(detections, obj_name)
+                object_count_scores.append(
+                    _score_object_count_inventory(obs_count, exp_count)
+                )
 
         relation_component = float(np.mean(relation_scores)) if relation_scores else 0.0
         if object_count_scores:
@@ -646,11 +902,36 @@ def do_grounding_dino_spatial_reward(
                 object_count_component = float(np.mean(object_count_scores))
         else:
             object_count_component = 0.0
+        eff_relation_weight = relation_weight
+        eff_object_weight = object_count_weight
+        if dynamic_stage_weighting:
+            eff_relation_weight, eff_object_weight = _stage_weighting(
+                relation_weight,
+                object_count_weight,
+                sampling_idx=debug_sampling_idx,
+                total_time_steps=debug_time_steps,
+                transition_progress=stage_transition_progress,
+                sharpness=stage_sharpness,
+                early_object_phase_fraction=stage_early_object_fraction,
+                early_object_boost=stage_early_object_boost,
+            )
+
         final_reward = (
-            relation_weight * relation_component
-            + object_count_weight * object_count_component
+            eff_relation_weight * relation_component
+            + eff_object_weight * object_count_component
         )
         rewards.append(final_reward)
+        if temporal_state is not None:
+            for rel_key, subject_det, object_det in relation_metas:
+                if rel_key is None:
+                    continue
+                temporal_state[rel_key] = {
+                    "subject_center": tuple(subject_det["center"]),
+                    "object_center": tuple(object_det["center"]),
+                    "sampling_idx": int(debug_sampling_idx)
+                    if debug_sampling_idx is not None
+                    else None,
+                }
 
         if debug_overlay_dir is not None and debug_sampling_idx is not None:
             rtag = f"{final_reward:+.5f}".replace("+", "p").replace("-", "m")
@@ -665,6 +946,7 @@ def do_grounding_dino_spatial_reward(
                 title_lines=[
                     f"sampling_idx={debug_sampling_idx} particle={i}",
                     f"reward={final_reward:.5f} (rel={relation_component:.3f} inv={object_count_component:.3f})",
+                    f"weights rel={eff_relation_weight:.2f} inv={eff_object_weight:.2f}",
                     prompts[i][:90],
                 ],
             )

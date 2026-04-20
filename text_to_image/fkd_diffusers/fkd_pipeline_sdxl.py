@@ -700,6 +700,9 @@ class FKDStableDiffusionXL(
         print('Args:', fkd_args)
         fkd = None
         if fkd_args is not None and fkd_args['use_smc']:
+            fkd_args.setdefault("reward_config", {})
+            fkd_args["reward_config"]["temporal_state"] = {}
+            fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
             _fkd_kw = dict(fkd_args)
             _fkd_kw["device"] = (
                 device if isinstance(device, torch.device) else torch.device(device)
@@ -781,8 +784,9 @@ class FKDStableDiffusionXL(
 
                 # FK Steering Change
                 if fkd_args is not None and fkd_args['use_smc']:
+                    fkd_args.setdefault("reward_config", {})
+                    fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
                     if fkd_args.get("grounding_overlay_dir"):
-                        fkd_args.setdefault("reward_config", {})
                         fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
                             "grounding_overlay_dir"
                         ]
