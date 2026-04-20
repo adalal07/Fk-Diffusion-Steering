@@ -429,6 +429,41 @@ def _score_object_count_inventory(observed_count, expected_count):
     return 0.0
 
 
+def _score_object_count_inventory_topk(
+    detections,
+    obj_name,
+    expected_count,
+    *,
+    extra_penalty_conf_threshold=0.5,
+):
+    """
+    Robust inventory scorer for noisy steps:
+    - Uses only top-K match scores where K=expected_count.
+    - Penalizes extras only when extra detections are high confidence.
+    """
+    if expected_count <= 0:
+        return 1.0
+    scores = []
+    for det in detections:
+        s = float(_entity_match_score(det, obj_name))
+        if s > 0.0:
+            scores.append(s)
+    scores.sort(reverse=True)
+    top_scores = scores[: int(expected_count)]
+    if not top_scores:
+        return 0.0
+    presence_score = float(np.mean(top_scores))
+    extra_penalty = 1.0
+    if len(scores) > int(expected_count):
+        extras = scores[int(expected_count) :]
+        extra_high_conf = [s for s in extras if s > float(extra_penalty_conf_threshold)]
+        if extra_high_conf:
+            extra_penalty = float(expected_count) / float(
+                expected_count + len(extra_high_conf)
+            )
+    return float(np.clip(presence_score * extra_penalty, 0.0, 1.0))
+
+
 def _entity_match_score(det, entity):
     """Higher is better; uses detector confidence × label match strength."""
     label = det["label"].lower().strip()
@@ -624,7 +659,7 @@ def do_grounding_dino_spatial_reward(
     prompts,
     spatial_relations=None,
     grounding_model_name="IDEA-Research/grounding-dino-base",
-    box_threshold=0.05,
+    box_threshold=0.30,
     text_threshold=0.25,
     align_scale=6.0,
     missing_box_penalty=-1.0,
@@ -641,6 +676,7 @@ def do_grounding_dino_spatial_reward(
     debug_sampling_idx=None,
     debug_time_steps=None,
     use_soft_detections=True,
+    use_soft_detections_outside_steering=False,
     soft_box_threshold=0.05,
     use_step_box_threshold_schedule=True,
     steering_phase_start_ratio=0.2,
@@ -648,6 +684,8 @@ def do_grounding_dino_spatial_reward(
     steering_phase_box_threshold=0.05,
     soft_missing_box_penalty=-0.2,
     use_max_entity_presence=True,
+    use_topk_inventory=True,
+    topk_extra_penalty_conf_threshold=0.5,
     dynamic_stage_weighting=True,
     stage_transition_progress=0.6,
     stage_sharpness=12.0,
@@ -660,6 +698,11 @@ def do_grounding_dino_spatial_reward(
     temporal_consistency_weight=0.3,
     temporal_tiebreak_weight=0.25,
     temporal_sigma=0.08,
+    relation_duplicate_aggregate="max",
+    dynamic_inventory_aggregate=True,
+    inventory_aggregate_early="mean",
+    inventory_aggregate_late="min",
+    inventory_aggregate_transition_progress=None,
 ):
     global REWARDS_DICT
 
@@ -667,6 +710,8 @@ def do_grounding_dino_spatial_reward(
         raise ValueError(
             "inventory_aggregate must be 'mean' or 'min' (min = strict: one bad entity tanks inventory)."
         )
+    if relation_duplicate_aggregate not in ("mean", "max"):
+        raise ValueError("relation_duplicate_aggregate must be 'mean' or 'max'.")
 
     if REWARDS_DICT["GroundingDINOSpatial"] is None:
         GroundingDinoForObjectDetection, GroundingDinoProcessor = _import_grounding_dino()
@@ -718,6 +763,8 @@ def do_grounding_dino_spatial_reward(
 
         width, height = image.size
         target_sizes = torch.tensor([[height, width]], device=device)
+        progress = None
+        in_steering_window = False
         eff_box_threshold = float(box_threshold)
         if (
             use_step_box_threshold_schedule
@@ -726,11 +773,14 @@ def do_grounding_dino_spatial_reward(
             and int(debug_time_steps) > 1
         ):
             progress = float(debug_sampling_idx) / float(max(int(debug_time_steps) - 1, 1))
-            if float(steering_phase_start_ratio) <= progress <= float(steering_phase_end_ratio):
+            in_steering_window = float(steering_phase_start_ratio) <= progress <= float(
+                steering_phase_end_ratio
+            )
+            if in_steering_window:
                 eff_box_threshold = min(
                     float(eff_box_threshold), float(steering_phase_box_threshold)
                 )
-        if use_soft_detections:
+        if use_soft_detections and (in_steering_window or use_soft_detections_outside_steering):
             eff_box_threshold = min(float(eff_box_threshold), float(soft_box_threshold))
         processed = _post_process_grounding_dino_detections(
             processor,
@@ -762,6 +812,7 @@ def do_grounding_dino_spatial_reward(
             )
 
         relation_scores = []
+        relation_scores_by_key = {}
         relation_metas = []
         for rel in prompt_relations:
             subject = _clean_entity(rel["subject"])
@@ -800,8 +851,14 @@ def do_grounding_dino_spatial_reward(
                     pair_presence = min(s_presence, o_presence)
                     soft_rel = float(soft_missing_box_penalty) * (1.0 - pair_presence)
                     relation_scores.append(soft_rel)
+                    relation_scores_by_key.setdefault((subject, relation, obj), []).append(
+                        soft_rel
+                    )
                 else:
                     relation_scores.append(missing_box_penalty)
+                    relation_scores_by_key.setdefault((subject, relation, obj), []).append(
+                        missing_box_penalty
+                    )
                 continue
 
             dx = subject_det["center"][0] - object_det["center"][0]
@@ -869,6 +926,9 @@ def do_grounding_dino_spatial_reward(
                     temporal_consistency_weight
                 ) * float(rel_score) * temporal_consistency
             relation_scores.append(float(rel_score))
+            relation_scores_by_key.setdefault((subject, relation, obj), []).append(
+                float(rel_score)
+            )
             relation_metas.append((rel_key, subject_det, object_det))
 
         if expected_object_counts is not None and i < len(expected_object_counts):
@@ -882,7 +942,16 @@ def do_grounding_dino_spatial_reward(
 
         object_count_scores = []
         for obj_name, exp_count in expected_counts.items():
-            if use_soft_detections and use_max_entity_presence:
+            if use_topk_inventory:
+                object_count_scores.append(
+                    _score_object_count_inventory_topk(
+                        detections,
+                        obj_name,
+                        exp_count,
+                        extra_penalty_conf_threshold=topk_extra_penalty_conf_threshold,
+                    )
+                )
+            elif use_soft_detections and use_max_entity_presence:
                 # Continuous proxy before objects are crisply formed.
                 soft_count = _soft_entity_count(detections, obj_name)
                 object_count_scores.append(
@@ -894,9 +963,31 @@ def do_grounding_dino_spatial_reward(
                     _score_object_count_inventory(obs_count, exp_count)
                 )
 
-        relation_component = float(np.mean(relation_scores)) if relation_scores else 0.0
+        if relation_scores_by_key:
+            grouped_relation_scores = []
+            for scores in relation_scores_by_key.values():
+                if relation_duplicate_aggregate == "max":
+                    grouped_relation_scores.append(float(max(scores)))
+                else:
+                    grouped_relation_scores.append(float(np.mean(scores)))
+            relation_component = float(np.mean(grouped_relation_scores))
+        else:
+            relation_component = float(np.mean(relation_scores)) if relation_scores else 0.0
+
+        current_inventory_aggregate = inventory_aggregate
+        if dynamic_inventory_aggregate:
+            inv_switch = (
+                float(stage_transition_progress)
+                if inventory_aggregate_transition_progress is None
+                else float(inventory_aggregate_transition_progress)
+            )
+            if progress is not None and progress < inv_switch:
+                current_inventory_aggregate = inventory_aggregate_early
+            else:
+                current_inventory_aggregate = inventory_aggregate_late
+
         if object_count_scores:
-            if inventory_aggregate == "min":
+            if current_inventory_aggregate == "min":
                 object_count_component = float(min(object_count_scores))
             else:
                 object_count_component = float(np.mean(object_count_scores))
