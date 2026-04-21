@@ -21,6 +21,15 @@ from fkd_class import FKD
 from rewards import get_reward_function
 
 import torch
+
+# Compatibility shim for newer transformers where FLAX_WEIGHTS_NAME was removed.
+try:
+    import transformers.utils as _tf_utils
+
+    if not hasattr(_tf_utils, "FLAX_WEIGHTS_NAME"):
+        _tf_utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
+except Exception:
+    pass
 from transformers import (
     CLIPImageProcessor,
     CLIPTextModel,
@@ -703,6 +712,22 @@ class FKDStableDiffusionXL(
             fkd_args.setdefault("reward_config", {})
             fkd_args["reward_config"]["temporal_state"] = {}
             fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
+            if fkd_args.get("intermediate_dir") and not fkd_args.get("intermediate_images_dir"):
+                fkd_args["intermediate_images_dir"] = fkd_args["intermediate_dir"]
+            run_output_dir = fkd_args.get("run_output_dir") or fkd_args.get("output_dir")
+            if run_output_dir:
+                fkd_args.setdefault(
+                    "intermediate_images_dir",
+                    os.path.join(run_output_dir, "intermediate"),
+                )
+                fkd_args.setdefault(
+                    "resampling_history_path",
+                    os.path.join(run_output_dir, "resampling_history.jsonl"),
+                )
+                fkd_args["reward_config"].setdefault(
+                    "qwen_log_path",
+                    os.path.join(run_output_dir, "qwen_intermediate_logs.jsonl"),
+                )
             _fkd_kw = dict(fkd_args)
             _fkd_kw["device"] = (
                 device if isinstance(device, torch.device) else torch.device(device)
@@ -719,6 +744,10 @@ class FKDStableDiffusionXL(
             self._last_fkd = fkd
             if fkd_args.get("grounding_overlay_dir"):
                 os.makedirs(fkd_args["grounding_overlay_dir"], exist_ok=True)
+            if fkd_args.get("moondream_overlay_dir"):
+                os.makedirs(fkd_args["moondream_overlay_dir"], exist_ok=True)
+            if fkd_args.get("intermediate_images_dir"):
+                os.makedirs(fkd_args["intermediate_images_dir"], exist_ok=True)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -786,21 +815,36 @@ class FKDStableDiffusionXL(
                 if fkd_args is not None and fkd_args['use_smc']:
                     fkd_args.setdefault("reward_config", {})
                     fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
+                    # Always expose current diffusion step to reward functions/loggers.
+                    fkd_args["reward_config"]["debug_sampling_idx"] = i
                     if fkd_args.get("grounding_overlay_dir"):
                         fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
                             "grounding_overlay_dir"
                         ]
-                        fkd_args["reward_config"]["debug_sampling_idx"] = i
+                    elif fkd_args.get("moondream_overlay_dir"):
+                        fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
+                            "moondream_overlay_dir"
+                        ]
                     latents, current_pop_images = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
                     )
 
-                    # if current_pop_images is not None:
-                    #     images = self.image_processor.postprocess(current_pop_images, output_type=output_type)
-
-                    #     for k, image in enumerate(images):
-                    #         os.makedirs('./fkd_images', exist_ok=True)
-                    #         image.save(f'./fkd_images/{i}_{k}.png')
+                    if (
+                        current_pop_images is not None
+                        and output_type != "latent"
+                        and fkd_args.get("intermediate_images_dir")
+                    ):
+                        step_dir = os.path.join(
+                            fkd_args["intermediate_images_dir"], f"step_{i:04d}"
+                        )
+                        os.makedirs(step_dir, exist_ok=True)
+                        inter_images = self.image_processor.postprocess(
+                            current_pop_images, output_type=output_type
+                        )
+                        for p_idx, inter_img in enumerate(inter_images):
+                            inter_img.save(
+                                os.path.join(step_dir, f"particle_{p_idx:02d}.png")
+                            )
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():

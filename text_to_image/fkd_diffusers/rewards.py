@@ -1,4 +1,5 @@
 import inspect
+import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,90 @@ import os
 import re
 import warnings
 import numpy as np
+import json
+
+# PyPI ``hpsv2`` wheels sometimes omit ``bpe_simple_vocab_16e6.txt.gz`` under
+# ``hpsv2/src/open_clip/``, which breaks HumanPreference scoring at runtime.
+_HPSV2_OPENCLIP_VOCAB_READY = False
+
+
+def _ensure_hpsv2_open_clip_vocab():
+    """
+    Ensure ``bpe_simple_vocab_16e6.txt.gz`` exists where bundled hpsv2 open_clip expects it.
+
+    Tries, in order: copy from ``open_clip``, copy from OpenAI ``clip``, then download
+    from the official CLIP repo. Raises ``RuntimeError`` with fix hints if all fail.
+    """
+    global _HPSV2_OPENCLIP_VOCAB_READY
+    if _HPSV2_OPENCLIP_VOCAB_READY:
+        return
+
+    hps_root = os.path.dirname(os.path.abspath(hpsv2.__file__))
+    dest_dir = os.path.join(hps_root, "src", "open_clip")
+    dest = os.path.join(dest_dir, "bpe_simple_vocab_16e6.txt.gz")
+
+    def _looks_valid(path):
+        try:
+            return os.path.isfile(path) and os.path.getsize(path) > 5000
+        except OSError:
+            return False
+
+    if _looks_valid(dest):
+        _HPSV2_OPENCLIP_VOCAB_READY = True
+        return
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    for mod_name in ("open_clip",):
+        try:
+            mod = __import__(mod_name)
+            src = os.path.join(
+                os.path.dirname(os.path.abspath(mod.__file__)),
+                "bpe_simple_vocab_16e6.txt.gz",
+            )
+            if _looks_valid(src):
+                shutil.copyfile(src, dest)
+                _HPSV2_OPENCLIP_VOCAB_READY = True
+                return
+        except ImportError:
+            continue
+
+    try:
+        clip_dir = os.path.dirname(os.path.abspath(clip.__file__))
+        src = os.path.join(clip_dir, "bpe_simple_vocab_16e6.txt.gz")
+        if _looks_valid(src):
+            shutil.copyfile(src, dest)
+            _HPSV2_OPENCLIP_VOCAB_READY = True
+            return
+    except Exception:
+        pass
+
+    url = "https://raw.githubusercontent.com/openai/CLIP/main/clip/bpe_simple_vocab_16e6.txt.gz"
+    dl_msg = "download not attempted"
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        if len(data) > 5000:
+            with open(dest, "wb") as f:
+                f.write(data)
+            _HPSV2_OPENCLIP_VOCAB_READY = True
+            return
+        dl_msg = f"download returned only {len(data)} bytes"
+    except Exception as dl_err:
+        dl_msg = str(dl_err)
+
+    raise RuntimeError(
+        "HumanPreference (hpsv2): tokenizer asset "
+        "`bpe_simple_vocab_16e6.txt.gz` is missing from the hpsv2 install. "
+        "Fix options:\n"
+        "  1) `pip install -U open_clip_torch` then re-run (this code will copy the vocab into hpsv2).\n"
+        "  2) `pip install --force-reinstall hpsv2` or try `pip install hpsv2x` (community repack).\n"
+        f"  3) Manually download:\n     {url}\n"
+        f"     to:\n     {dest}\n"
+        f"Download attempt failed with: {dl_msg}"
+    )
 
 from llm_grading import LLMGrader
 
@@ -17,6 +102,8 @@ REWARDS_DICT = {
     "ImageReward": None,
     "LLMGrader": None,
     "GroundingDINOSpatial": None,
+    "MoonDreamStyle": None,
+    "Qwen3VLStyle": None,
 }
 
 
@@ -32,7 +119,7 @@ def get_reward_function(
     # Backward-compatible alias: reward_kwargs -> reward_config
     if reward_config is None:
         reward_config = reward_kwargs if reward_kwargs is not None else {}
-    if reward_name != "LLMGrader":
+    if reward_name not in ("LLMGrader",):
         print("`metric_to_chase` will be ignored as it only applies to 'LLMGrader' as the `reward_name`")
     if reward_name == "ImageReward":
         return do_image_reward(images=images, prompts=prompts)
@@ -57,7 +144,31 @@ def get_reward_function(
             debug_sampling_idx=debug_sampling_idx,
             **cfg,
         )
-    
+
+    elif reward_name == "MoonDreamStyle":
+        cfg = dict(reward_config or {})
+        debug_overlay_dir = cfg.pop("debug_overlay_dir", None)
+        debug_sampling_idx = cfg.pop("debug_sampling_idx", None)
+        return do_moondream_style_reward(
+            images=images,
+            prompts=prompts,
+            debug_overlay_dir=debug_overlay_dir,
+            debug_sampling_idx=debug_sampling_idx,
+            **cfg,
+        )
+
+    elif reward_name == "Qwen3VLStyle":
+        cfg = dict(reward_config or {})
+        debug_overlay_dir = cfg.pop("debug_overlay_dir", None)
+        debug_sampling_idx = cfg.pop("debug_sampling_idx", None)
+        return do_qwen3_vl_style_reward(
+            images=images,
+            prompts=prompts,
+            debug_overlay_dir=debug_overlay_dir,
+            debug_sampling_idx=debug_sampling_idx,
+            **cfg,
+        )
+
     else:
         raise ValueError(f"Unknown metric: {reward_name}")
 
@@ -1053,9 +1164,903 @@ def do_grounding_dino_spatial_reward(
         )
 
     return rewards
-    
+
+
+def _parse_moondream_integer(text: str, lo: int = -50, hi: int = 50):
+    """Extract an integer rating in [lo, hi] from model text."""
+    if not text:
+        return None
+    candidates = []
+    for m in re.finditer(r"-?\d+", text.replace(",", "")):
+        try:
+            candidates.append(int(m.group()))
+        except ValueError:
+            continue
+    for n in candidates:
+        if lo <= n <= hi:
+            return n
+    if candidates:
+        return max(lo, min(hi, candidates[0]))
+    return None
+
+
+def _parse_rating_number(text: str, lo: float = -50.0, hi: float = 50.0):
+    """Extract a numeric rating (int/float) in [lo, hi] from model text."""
+    if not text:
+        return None
+    cleaned = text.replace(",", "")
+    candidates = []
+    for m in re.finditer(r"-?\d+(?:\.\d+)?", cleaned):
+        try:
+            candidates.append(float(m.group()))
+        except ValueError:
+            continue
+    for n in candidates:
+        if float(lo) <= n <= float(hi):
+            return float(n)
+    if candidates:
+        return float(max(float(lo), min(float(hi), candidates[0])))
+    return None
+
+
+def _normalize_rating_to_unit(raw: int, lo: int, hi: int) -> float:
+    """Map [lo, hi] linearly to [-1, 1]."""
+    if hi == lo:
+        return 0.0
+    mid = (lo + hi) / 2.0
+    half = (hi - lo) / 2.0
+    return float((raw - mid) / max(half, 1e-8))
+
+
+def _save_moondream_debug_pil(image_pil, out_path, *, title_lines=None):
+    """Save image with VLM debug text overlay."""
+    from PIL import ImageDraw, ImageFont
+
+    img = image_pil.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    if title_lines:
+        y = 4
+        for line in title_lines[:8]:
+            draw.text((4, y), str(line)[:120], fill=(255, 255, 255), font=font)
+            draw.text((5, y + 1), str(line)[:120], fill=(0, 0, 0), font=font)
+            y += 12
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    img.save(out_path)
+
+
+def _import_moondream_hf():
+    try:
+        from transformers import AutoModelForCausalLM
+    except ImportError as e:
+        raise ImportError(
+            "MoonDreamStyle requires `transformers` with Moondream remote code. "
+            "Install: pip install 'transformers>=4.51' accelerate"
+        ) from e
+    return AutoModelForCausalLM
+
+
+def _ensure_transformers_tied_weights_compat():
+    """
+    Compatibility shim for some remote-code models (including older HF Moondream
+    wrappers) on newer Transformers runtimes that expect `all_tied_weights_keys`.
+    """
+    try:
+        import transformers.modeling_utils as _mu
+        from transformers.modeling_utils import PreTrainedModel
+    except Exception:
+        return
+
+    # Ensure `all_tied_weights_keys` is dict-like (supports `.keys()`), since
+    # some remote-code models expose list/tuple and newer transformers expects dict-like.
+    def _normalize_tied_keys_dict(keys):
+        if keys is None:
+            return {}
+        if isinstance(keys, dict):
+            return keys
+        if isinstance(keys, (list, tuple, set)):
+            return {str(k): None for k in keys}
+        return {str(keys): None}
+
+    @property
+    def _all_tied_weights_keys_compat(self):
+        override = getattr(self, "_all_tied_weights_keys_override", None)
+        if override is not None:
+            return _normalize_tied_keys_dict(override)
+        keys = getattr(self, "_tied_weights_keys", None)
+        return _normalize_tied_keys_dict(keys)
+
+    @_all_tied_weights_keys_compat.setter
+    def _all_tied_weights_keys_compat(self, value):
+        # transformers post_init assigns into this field in newer versions.
+        self._all_tied_weights_keys_override = _normalize_tied_keys_dict(value)
+
+    PreTrainedModel.all_tied_weights_keys = _all_tied_weights_keys_compat
+
+    # Some remote-code models expose `_tied_weights_keys` as a list, while some
+    # transformers versions expect a dict-like object with `.keys()`.
+    # Patch helper to gracefully support either type.
+    fn = getattr(_mu, "_get_tied_weight_keys", None)
+    if fn is None:
+        return
+    if getattr(fn, "_moondream_list_compat", False):
+        return
+
+    def _patched_get_tied_weight_keys(module, prefix=""):
+        tied_keys = set()
+        tied_weight_keys = getattr(module, "_tied_weights_keys", None)
+        if tied_weight_keys is not None:
+            if isinstance(tied_weight_keys, dict):
+                names = tied_weight_keys.keys()
+            elif isinstance(tied_weight_keys, (list, tuple, set)):
+                names = tied_weight_keys
+            else:
+                names = [str(tied_weight_keys)]
+            for name in names:
+                tied_keys.add(prefix + str(name))
+        for name, submodule in module.named_children():
+            tied_keys |= _patched_get_tied_weight_keys(submodule, prefix=prefix + name + ".")
+        return tied_keys
+
+    _patched_get_tied_weight_keys._moondream_list_compat = True
+    _mu._get_tied_weight_keys = _patched_get_tied_weight_keys
+
+    # Patch mark_tied_weights_as_initialized to accept list-like tied keys too.
+    _orig_mark = getattr(PreTrainedModel, "mark_tied_weights_as_initialized", None)
+    if _orig_mark is not None and not getattr(_orig_mark, "_moondream_list_compat", False):
+        def _patched_mark_tied_weights_as_initialized(self, loading_info):
+            tied = getattr(self, "all_tied_weights_keys", {})
+            if isinstance(tied, dict):
+                tied_params = tied.keys()
+            elif isinstance(tied, (list, tuple, set)):
+                tied_params = tied
+            elif tied is None:
+                tied_params = []
+            else:
+                tied_params = [tied]
+            for tied_param in tied_params:
+                try:
+                    param = self.get_parameter(str(tied_param))
+                    param._is_hf_initialized = True
+                except Exception:
+                    continue
+        _patched_mark_tied_weights_as_initialized._moondream_list_compat = True
+        PreTrainedModel.mark_tied_weights_as_initialized = _patched_mark_tied_weights_as_initialized
+
+
+def _ensure_torch_sdpa_enable_gqa_compat():
+    """
+    Moondream3 remote code may call torch SDPA with `enable_gqa=...`.
+    Older torch versions don't expose this kwarg. Ignore it when unsupported.
+    """
+    try:
+        import inspect as _inspect
+        import torch.nn.functional as _F
+    except Exception:
+        return
+
+    fn = getattr(_F, "scaled_dot_product_attention", None)
+    if fn is None:
+        return
+    try:
+        has_enable_gqa = "enable_gqa" in _inspect.signature(fn).parameters
+    except Exception:
+        # On some torch builds signature introspection fails for C-implemented funcs.
+        # Be conservative and patch in that case.
+        has_enable_gqa = False
+    if has_enable_gqa or getattr(fn, "_moondream_enable_gqa_compat", False):
+        return
+
+    def _patched_sdpa(*args, **kwargs):
+        kwargs.pop("enable_gqa", None)
+        return fn(*args, **kwargs)
+
+    _patched_sdpa._moondream_enable_gqa_compat = True
+    _F.scaled_dot_product_attention = _patched_sdpa
+
+
+def _import_moondream_sdk():
+    try:
+        import moondream as md
+    except ImportError as e:
+        raise ImportError(
+            "MoonDreamStyle backend='sdk' requires `moondream`. Install: pip install moondream"
+        ) from e
+    return md
+
+
+def _import_qwen3_vl_hf():
+    try:
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+    except ImportError as e:
+        raise ImportError(
+            "Qwen3VLStyle requires a recent `transformers` with vision-language "
+            "generation support. Install: pip install -U 'transformers>=4.51' accelerate"
+        ) from e
+    return AutoModelForImageTextToText, AutoProcessor
+
+
+def _qwen3_vl_query_text(
+    style_target: str,
+    rating_min: int,
+    rating_max: int,
+):
+    return (
+        f"Evaluate how strongly this image matches a '{style_target}' visual style. "
+        f"Return one integer between {rating_min} and {rating_max} only, where "
+        f"{rating_max} means extremely strong {style_target} style and "
+        f"{rating_min} means not {style_target} at all. "
+        "Output only the integer with no extra text."
+    )
+
+
+def do_qwen3_vl_style_reward(
+    *,
+    images,
+    prompts,
+    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_hf_device=None,
+    qwen_hf_device_map=None,
+    qwen_hf_dtype=None,
+    qwen_hf_max_memory=None,
+    qwen_hf_offload_folder=None,
+    qwen_hf_low_cpu_mem_usage=True,
+    qwen_tp_plan=None,
+    qwen_attn_implementation=None,
+    qwen_trust_remote_code=True,
+    qwen_force_reload=False,
+    hf_revision=None,
+    style_target="comic-book",
+    query_text=None,
+    include_prompt_context=True,
+    rating_min=-50,
+    rating_max=50,
+    query_max_tokens=24,
+    qwen_do_sample=False,
+    qwen_temperature=0.0,
+    qwen_top_p=1.0,
+    qwen_debug_print=False,
+    qwen_log_path=None,
+    qwen_log_to_output=True,
+    qwen_retry_on_parse_fail=True,
+    qwen_retry_max_new_tokens=8,
+    warn_parse_failures=True,
+    debug_overlay_dir=None,
+    debug_sampling_idx=None,
+    **_unused_kwargs,
+):
+    """
+    Qwen3-VL style rating reward:
+    - asks for one integer in [rating_min, rating_max]
+    - linearly rescales to [-1, 1] for FK steering
+    """
+    global REWARDS_DICT
+
+    if rating_min >= rating_max:
+        raise ValueError("rating_min must be < rating_max")
+    if query_text is None:
+        query_text = _qwen3_vl_query_text(
+            style_target=style_target,
+            rating_min=int(rating_min),
+            rating_max=int(rating_max),
+        )
+
+    dtype = qwen_hf_dtype
+    if dtype is None:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    target_device = (
+        qwen_hf_device
+        if qwen_hf_device is not None
+        else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
+    load_kw = {}
+    if hf_revision is not None:
+        load_kw["revision"] = hf_revision
+    device_map = qwen_hf_device_map
+    if device_map is None:
+        device_map = None
+    # Reload when model-loading parameters change so notebook config edits are honored.
+    cache_key = (
+        str(qwen_model_name),
+        str(hf_revision),
+        str(dtype),
+        str(target_device),
+        repr(device_map),
+        repr(qwen_hf_max_memory),
+        str(qwen_hf_offload_folder),
+        bool(qwen_hf_low_cpu_mem_usage),
+        str(qwen_tp_plan),
+        str(qwen_attn_implementation),
+        bool(qwen_trust_remote_code),
+    )
+
+    cached = REWARDS_DICT["Qwen3VLStyle"]
+    needs_reload = (
+        bool(qwen_force_reload)
+        or cached is None
+        or cached.get("cache_key") != cache_key
+    )
+    if needs_reload:
+        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
+
+        try:
+            model_load_kw = dict(load_kw)
+            model_load_kw["device_map"] = device_map
+            model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
+            model_load_kw["low_cpu_mem_usage"] = bool(qwen_hf_low_cpu_mem_usage)
+            if qwen_hf_max_memory is not None:
+                model_load_kw["max_memory"] = qwen_hf_max_memory
+            if qwen_hf_offload_folder is not None:
+                model_load_kw["offload_folder"] = qwen_hf_offload_folder
+            if qwen_tp_plan is not None:
+                model_load_kw["tp_plan"] = qwen_tp_plan
+            if qwen_attn_implementation is not None:
+                model_load_kw["attn_implementation"] = qwen_attn_implementation
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                torch_dtype=dtype,
+                **model_load_kw,
+            )
+        except TypeError:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                dtype=dtype,
+                **model_load_kw,
+            )
+        if device_map is None:
+            model = model.to(target_device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
+        cache_entry = {
+            "model_name": qwen_model_name,
+            "model": model,
+            "processor": processor,
+            "device": target_device,
+            "device_map": device_map,
+            "cache_key": cache_key,
+        }
+        REWARDS_DICT["Qwen3VLStyle"] = cache_entry
+
+    cache_entry = REWARDS_DICT["Qwen3VLStyle"]
+    model = cache_entry["model"]
+    processor = cache_entry["processor"]
+    target_device = cache_entry["device"]
+    using_device_map = cache_entry["device_map"] is not None
+
+    effective_qwen_log_path = qwen_log_path
+    if effective_qwen_log_path is None and qwen_log_to_output:
+        # Default log target in project output folder.
+        effective_qwen_log_path = os.path.join("output", "qwen_intermediate_logs.jsonl")
+
+    rewards = []
+    for i, image in enumerate(images):
+        per_image_query = query_text
+        if include_prompt_context and i < len(prompts):
+            per_image_query = (
+                f"{query_text}\n"
+                f"Generation prompt context: {prompts[i]}\n"
+                "Score only the rendered visual style in the image."
+            )
+        messages = [
+            {
+                "role": "user",
+                # Include the concrete image payload in chat content for processors
+                # that rely on the structured multimodal template.
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": per_image_query},
+                ],
+            }
+        ]
+        prompt_for_model = per_image_query
+        if hasattr(processor, "apply_chat_template"):
+            try:
+                prompt_for_model = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt_for_model = per_image_query
+
+        inputs = processor(
+            text=[prompt_for_model],
+            images=[image],
+            return_tensors="pt",
+        )
+        if not using_device_map:
+            inputs = {k: v.to(target_device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=int(query_max_tokens),
+                do_sample=bool(qwen_do_sample),
+                temperature=float(qwen_temperature),
+                top_p=float(qwen_top_p),
+            )
+        answer = ""
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            generated_ids = generated[:, inputs["input_ids"].shape[-1] :]
+            answer = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+        if not answer:
+            # Fallback decode path for processor/model variants where slicing with
+            # prompt length yields empty text.
+            answer = processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+
+        raw = _parse_rating_number(answer, float(rating_min), float(rating_max))
+        retried = False
+        if raw is None and qwen_retry_on_parse_fail:
+            retried = True
+            strict_query = (
+                f"Return only one integer in [{int(rating_min)}, {int(rating_max)}] "
+                f"for how '{style_target}' the image style is. "
+                "No reasoning. No words. Integer only."
+            )
+            strict_messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": strict_query},
+                    ],
+                }
+            ]
+            strict_prompt = strict_query
+            if hasattr(processor, "apply_chat_template"):
+                try:
+                    strict_prompt = processor.apply_chat_template(
+                        strict_messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    strict_prompt = strict_query
+            strict_inputs = processor(
+                text=[strict_prompt],
+                images=[image],
+                return_tensors="pt",
+            )
+            if not using_device_map:
+                strict_inputs = {k: v.to(target_device) for k, v in strict_inputs.items()}
+            with torch.no_grad():
+                strict_generated = model.generate(
+                    **strict_inputs,
+                    max_new_tokens=int(qwen_retry_max_new_tokens),
+                    do_sample=False,
+                )
+            strict_answer = ""
+            if "input_ids" in strict_inputs and strict_inputs["input_ids"] is not None:
+                strict_ids = strict_generated[:, strict_inputs["input_ids"].shape[-1] :]
+                strict_answer = processor.batch_decode(
+                    strict_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )[0].strip()
+            if not strict_answer:
+                strict_answer = processor.batch_decode(
+                    strict_generated,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )[0].strip()
+            # Keep whichever response parses; prefer strict retry when available.
+            strict_raw = _parse_rating_number(
+                strict_answer, float(rating_min), float(rating_max)
+            )
+            if strict_raw is not None:
+                answer = strict_answer
+                raw = strict_raw
+
+        if qwen_debug_print:
+            print(
+                "[Qwen3VLStyle] "
+                f"idx={i} style={style_target!r} retried={retried} "
+                f"raw_answer={answer[:220]!r} parsed={raw}"
+            )
+        if raw is None:
+            if warn_parse_failures:
+                warnings.warn(
+                    f"Qwen3VLStyle: could not parse integer in [{rating_min},{rating_max}] "
+                    f"from answer={answer!r}; using 0.0 reward.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            reward = 0.0
+        else:
+            reward = _normalize_rating_to_unit(
+                float(raw), float(rating_min), float(rating_max)
+            )
+        rewards.append(float(reward))
+
+        if effective_qwen_log_path:
+            log_parent = os.path.dirname(effective_qwen_log_path)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+            rec = {
+                "sampling_idx": int(debug_sampling_idx)
+                if debug_sampling_idx is not None
+                else None,
+                "particle_idx": int(i),
+                "style_target": str(style_target),
+                "query_text": str(per_image_query),
+                "raw_answer": str(answer),
+                "parsed_rating": float(raw) if raw is not None else None,
+                "reward": float(reward),
+                "retried_on_parse_fail": bool(retried),
+                "rating_min": int(rating_min),
+                "rating_max": int(rating_max),
+            }
+            with open(effective_qwen_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+        if debug_overlay_dir is not None and debug_sampling_idx is not None:
+            rtag = f"{reward:+.5f}".replace("+", "p").replace("-", "m")
+            out_path = os.path.join(
+                debug_overlay_dir,
+                f"step_{int(debug_sampling_idx):04d}_particle_{i:02d}_r{rtag}.png",
+            )
+            raw_disp = raw if raw is not None else "?"
+            _save_moondream_debug_pil(
+                image,
+                out_path,
+                title_lines=[
+                    f"sampling_idx={debug_sampling_idx} particle={i}",
+                    f"raw={raw_disp} reward[-1,1]={reward:.5f}",
+                    f"answer: {answer[:200]}",
+                    (prompts[i] if i < len(prompts) else "")[:90],
+                ],
+            )
+
+    return rewards
+
+
+def do_moondream_style_reward(
+    *,
+    images,
+    prompts,
+    moondream_backend="hf",
+    moondream_model_name="vikhyatk/moondream2",
+    moondream_api_key=None,
+    moondream_local=False,
+    moondream_hf_device=None,
+    moondream_hf_device_map=None,
+    moondream_hf_fallback_model="vikhyatk/moondream2",
+    moondream_hf_allow_cpu_fallback=False,
+    hf_revision=None,
+    query_text=None,
+    rating_min=-50,
+    rating_max=50,
+    query_temperature=0.2,
+    query_top_p=0.9,
+    query_max_tokens=64,
+    warn_parse_failures=True,
+    debug_overlay_dir=None,
+    debug_sampling_idx=None,
+    **_unused_kwargs,
+):
+    """
+    Moondream VLM style rating: asks for an integer in [rating_min, rating_max], then maps to [-1, 1].
+
+    Uses Moondream SDK by default; HF backend is available as fallback.
+    """
+    global REWARDS_DICT
+
+    # Apply once per call for robustness in hot-reload / cached-model notebook flows.
+    if moondream_backend == "hf":
+        _ensure_torch_sdpa_enable_gqa_compat()
+
+    if rating_min >= rating_max:
+        raise ValueError("rating_min must be < rating_max")
+
+    if query_text is None:
+        query_text = (
+            "On a scale from -50 to 50, rate how close the style of the current image is to a comic-book style. "
+            "Respond with only one integer."
+        )
+
+    if moondream_backend not in ("sdk", "hf"):
+        raise ValueError("moondream_backend must be 'sdk' or 'hf'")
+
+    cached = REWARDS_DICT["MoonDreamStyle"]
+    if cached is None or cached.get("backend") != moondream_backend:
+        if moondream_backend == "sdk":
+            md = _import_moondream_sdk()
+            key = moondream_api_key or os.getenv("MOONDREAM_API_KEY")
+            init_kw = {}
+            if key:
+                init_kw["api_key"] = key
+            if moondream_local:
+                init_kw["local"] = True
+            try:
+                model = md.vl(**init_kw)
+            except TypeError:
+                # Older/newer SDK parameter mismatch fallback.
+                if "local" in init_kw:
+                    init_kw.pop("local", None)
+                model = md.vl(**init_kw)
+            REWARDS_DICT["MoonDreamStyle"] = {"backend": "sdk", "model": model}
+        else:
+            AutoModelForCausalLM = _import_moondream_hf()
+            _ensure_transformers_tied_weights_compat()
+            _ensure_torch_sdpa_enable_gqa_compat()
+            load_kw = dict(trust_remote_code=True)
+            if hf_revision is not None:
+                load_kw["revision"] = hf_revision
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            target_device = (
+                moondream_hf_device
+                if moondream_hf_device is not None
+                else ("cuda:0" if torch.cuda.is_available() else "cpu")
+            )
+            # Default to single-device to avoid cross-GPU encode/query mismatches.
+            device_map = moondream_hf_device_map
+            if device_map is None:
+                device_map = None
+
+            load_model_name = moondream_model_name
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    load_model_name,
+                    dtype=dtype,
+                    device_map=device_map,
+                    **load_kw,
+                )
+            except TypeError:
+                # Some versions still expect torch_dtype.
+                model = AutoModelForCausalLM.from_pretrained(
+                    load_model_name,
+                    torch_dtype=dtype,
+                    device_map=device_map,
+                    **load_kw,
+                )
+            except ModuleNotFoundError as e:
+                if (
+                    "torch.nn.attention.flex_attention" in str(e)
+                    and moondream_hf_fallback_model
+                    and moondream_hf_fallback_model != moondream_model_name
+                ):
+                    warnings.warn(
+                        "MoonDreamStyle(hf): current torch build lacks flex_attention "
+                        f"required by {moondream_model_name}. Falling back to "
+                        f"{moondream_hf_fallback_model}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    load_model_name = moondream_hf_fallback_model
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            load_model_name,
+                            dtype=dtype,
+                            device_map=device_map,
+                            **load_kw,
+                        )
+                    except TypeError:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            load_model_name,
+                            torch_dtype=dtype,
+                            device_map=device_map,
+                            **load_kw,
+                        )
+                else:
+                    raise
+            except AttributeError as e:
+                # Compatibility fallback for tied-weights metadata shape mismatches
+                # seen in some moondream remote-code + transformers combinations.
+                if "list" in str(e) and "keys" in str(e):
+                    warnings.warn(
+                        "MoonDreamStyle(hf): hit tied-weights compatibility path; "
+                        "retrying load with low_cpu_mem_usage=False and no device_map.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            load_model_name,
+                            dtype=dtype,
+                            device_map=None,
+                            low_cpu_mem_usage=False,
+                            **load_kw,
+                        )
+                    except TypeError:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            load_model_name,
+                            torch_dtype=dtype,
+                            device_map=None,
+                            low_cpu_mem_usage=False,
+                            **load_kw,
+                        )
+                    model = model.to(target_device)
+                else:
+                    raise
+            else:
+                # If loaded without dispatch map, explicitly place model on one device.
+                if device_map is None:
+                    model = model.to(target_device)
+            model.eval()
+            REWARDS_DICT["MoonDreamStyle"] = {"backend": "hf", "model": model}
+
+    model = REWARDS_DICT["MoonDreamStyle"]["model"]
+    backend = REWARDS_DICT["MoonDreamStyle"]["backend"]
+    settings = {
+        "temperature": float(query_temperature),
+        "top_p": float(query_top_p),
+        "max_tokens": int(query_max_tokens),
+    }
+
+    rewards = []
+    for i, image in enumerate(images):
+        if backend == "sdk":
+            try:
+                out = model.query(image, query_text)
+            except TypeError:
+                out = model.query(image, query_text, stream=False)
+        else:
+            with torch.no_grad():
+                enc = model.encode_image(image)
+                try:
+                    out = model.query(enc, query_text, settings=settings)
+                except TypeError:
+                    out = model.query(enc, query_text)
+                except AttributeError as e:
+                    # Some moondream3 + torch combinations fail at runtime due to
+                    # FlexAttention BlockMask API differences (e.g. missing seq_lengths).
+                    if (
+                        "BlockMask" in str(e)
+                        and "seq_lengths" in str(e)
+                        and moondream_hf_fallback_model
+                        and moondream_hf_fallback_model != moondream_model_name
+                    ):
+                        warnings.warn(
+                            "MoonDreamStyle(hf): moondream3 BlockMask API mismatch at query time; "
+                            f"switching to fallback model {moondream_hf_fallback_model}.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        AutoModelForCausalLM = _import_moondream_hf()
+                        _ensure_transformers_tied_weights_compat()
+                        _ensure_torch_sdpa_enable_gqa_compat()
+                        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                        load_kw = dict(trust_remote_code=True)
+                        if hf_revision is not None:
+                            load_kw["revision"] = hf_revision
+                        try:
+                            fallback_model = AutoModelForCausalLM.from_pretrained(
+                                moondream_hf_fallback_model,
+                                dtype=dtype,
+                                device_map=moondream_hf_device_map,
+                                **load_kw,
+                            )
+                        except TypeError:
+                            fallback_model = AutoModelForCausalLM.from_pretrained(
+                                moondream_hf_fallback_model,
+                                torch_dtype=dtype,
+                                device_map=moondream_hf_device_map,
+                                **load_kw,
+                            )
+                        if moondream_hf_device_map is None:
+                            target_device = (
+                                moondream_hf_device
+                                if moondream_hf_device is not None
+                                else ("cuda:0" if torch.cuda.is_available() else "cpu")
+                            )
+                            fallback_model = fallback_model.to(target_device)
+                        fallback_model.eval()
+                        REWARDS_DICT["MoonDreamStyle"] = {
+                            "backend": "hf",
+                            "model": fallback_model,
+                        }
+                        model = fallback_model
+                        enc = model.encode_image(image)
+                        try:
+                            out = model.query(enc, query_text, settings=settings)
+                        except TypeError:
+                            out = model.query(enc, query_text)
+                    else:
+                        raise
+                except RuntimeError as e:
+                    msg = str(e).lower()
+                    if (
+                        "probability tensor contains either `inf`, `nan`" in msg
+                        or "probability tensor contains either inf, nan" in msg
+                    ):
+                        safe_settings = {
+                            "temperature": 0.7,
+                            "top_p": 0.95,
+                            "max_tokens": int(min(query_max_tokens, 24)),
+                        }
+                        warnings.warn(
+                            "MoonDreamStyle(hf): NaN/Inf sampling probs; retrying "
+                            "query with safer sampling settings.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        try:
+                            out = model.query(enc, query_text, settings=safe_settings)
+                        except TypeError:
+                            out = model.query(enc, query_text)
+                    elif (
+                        "device-side assert triggered" in msg
+                        or "cuda error" in msg
+                        or "multinomial" in msg
+                    ):
+                        warnings.warn(
+                            "MoonDreamStyle(hf): CUDA sampling assert; retrying "
+                            "query with safer settings, then CPU fallback if needed.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        safe_settings = {
+                            "temperature": 0.7,
+                            "top_p": 0.95,
+                            "max_tokens": int(min(query_max_tokens, 24)),
+                        }
+                        try:
+                            out = model.query(enc, query_text, settings=safe_settings)
+                        except Exception:
+                            if moondream_hf_allow_cpu_fallback:
+                                # Optional last resort: run the Moondream query on CPU for stability.
+                                model = model.to("cpu")
+                                REWARDS_DICT["MoonDreamStyle"]["model"] = model
+                                enc_cpu = model.encode_image(image)
+                                try:
+                                    out = model.query(enc_cpu, query_text, settings=safe_settings)
+                                except TypeError:
+                                    out = model.query(enc_cpu, query_text)
+                            else:
+                                raise RuntimeError(
+                                    "MoonDreamStyle(hf): CUDA query failed and CPU fallback is disabled "
+                                    "(moondream_hf_allow_cpu_fallback=False). "
+                                    "Try safer settings, reduce query_max_tokens, or enable CPU fallback explicitly."
+                                )
+                    else:
+                        raise
+        if isinstance(out, dict):
+            answer = out.get("answer", "")
+        else:
+            answer = str(out)
+        raw = _parse_moondream_integer(answer, int(rating_min), int(rating_max))
+        if raw is None:
+            if warn_parse_failures:
+                warnings.warn(
+                    f"MoonDreamStyle: could not parse integer in [{rating_min},{rating_max}] "
+                    f"from answer={answer!r}; using 0.0 reward.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            reward = 0.0
+        else:
+            reward = _normalize_rating_to_unit(raw, int(rating_min), int(rating_max))
+        rewards.append(float(reward))
+
+        if debug_overlay_dir is not None and debug_sampling_idx is not None:
+            rtag = f"{reward:+.5f}".replace("+", "p").replace("-", "m")
+            out_path = os.path.join(
+                debug_overlay_dir,
+                f"step_{int(debug_sampling_idx):04d}_particle_{i:02d}_r{rtag}.png",
+            )
+            raw_disp = raw if raw is not None else "?"
+            _save_moondream_debug_pil(
+                image,
+                out_path,
+                title_lines=[
+                    f"sampling_idx={debug_sampling_idx} particle={i}",
+                    f"raw={raw_disp} reward[-1,1]={reward:.5f}",
+                    f"answer: {answer[:200]}",
+                    (prompts[i] if i < len(prompts) else "")[:90],
+                ],
+            )
+
+    return rewards
+
+
 # Compute human preference score
 def do_human_preference_score(*, images, prompts, use_paths=False):
+    _ensure_hpsv2_open_clip_vocab()
     if use_paths:
         scores = hpsv2.score(images, prompts, hps_version="v2.1")
         scores = [float(score) for score in scores]

@@ -2,6 +2,7 @@
 Utility functions for the FKD pipeline.
 """
 import warnings
+import json
 
 import torch
 from diffusers import DDIMScheduler
@@ -16,6 +17,8 @@ from fkd_diffusers.rewards import (
     do_human_preference_score,
     do_llm_grading,
     do_grounding_dino_spatial_reward,
+    do_moondream_style_reward,
+    do_qwen3_vl_style_reward
 )
 
 
@@ -134,6 +137,28 @@ def do_eval(*, prompt, images, metrics_to_compute, reward_config=None):
             results[metric]["max"] = vmax
             results[metric]["min"] = vmin
 
+        elif metric == "MoonDreamStyle":
+            results[metric] = {}
+            results[metric]["result"] = do_moondream_style_reward(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
+        elif metric == "Qwen3VLStyle":
+            results[metric] = {}
+            results[metric]["result"] = do_qwen3_vl_style_reward(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
         else:
             raise ValueError(f"Unknown metric: {metric}")
 
@@ -211,3 +236,155 @@ def plot_fkd_reward_trace(
             "save_path was set but ax was provided; save the figure from the Figure object instead."
         )
     return None
+
+
+def plot_metric_scores(
+    metric_name,
+    metric_result,
+    *,
+    title=None,
+    save_path=None,
+    figsize=(7, 3.8),
+    ax=None,
+):
+    """
+    Plot per-particle scores for any evaluated reward metric.
+
+    Parameters
+    ----------
+    metric_name : str
+        Name in results dict, e.g. ``Clip-Score`` / ``ImageReward`` / ``HumanPreference``.
+    metric_result : dict
+        ``results[metric_name]`` from ``do_eval``; must include key ``result`` as a list of scalars.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "plot_metric_scores requires matplotlib. pip install matplotlib"
+        ) from e
+
+    if not metric_result or "result" not in metric_result:
+        warnings.warn(f"plot_metric_scores: no result found for metric {metric_name}.")
+        return None
+    vals = metric_result["result"]
+    if vals is None or len(vals) == 0:
+        warnings.warn(f"plot_metric_scores: empty result for metric {metric_name}.")
+        return None
+
+    xs = list(range(len(vals)))
+    created_fig = ax is None
+    if created_fig:
+        _, ax = plt.subplots(figsize=figsize)
+
+    ax.plot(xs, vals, marker="o", linewidth=1.4, alpha=0.9, label=metric_name)
+    ax.set_xlabel("Particle index")
+    ax.set_ylabel("Score")
+    ax.set_title(title or f"{metric_name} scores by particle")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+
+    if created_fig:
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        return ax.figure
+    if save_path:
+        warnings.warn(
+            "save_path was set but ax was provided; save the figure from the Figure object instead."
+        )
+    return None
+
+
+def plot_resampling_diagnostics(
+    resampling_history_path,
+    *,
+    title_prefix="FKD resampling diagnostics",
+    save_path=None,
+    figsize=(10, 8),
+):
+    """
+    Plot FKD resampling diagnostics from ``resampling_history.jsonl``.
+
+    Produces three stacked plots:
+    - ESS vs sampling step
+    - Max normalized weight vs sampling step
+    - Unique selected parent count vs sampling step
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "plot_resampling_diagnostics requires matplotlib. pip install matplotlib"
+        ) from e
+
+    rows = []
+    with open(resampling_history_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    if not rows:
+        warnings.warn(
+            f"plot_resampling_diagnostics: no rows found in {resampling_history_path!r}."
+        )
+        return None
+
+    xs = []
+    ess_vals = []
+    max_norm_w = []
+    uniq_parents = []
+    did_resample = []
+    for r in rows:
+        step = int(r.get("sampling_idx", 0))
+        xs.append(step)
+        ess = r.get("ess", None)
+        ess_vals.append(float("nan") if ess is None else float(ess))
+        weights = [float(w) for w in r.get("weights", [])]
+        if weights:
+            wt = torch.tensor(weights, dtype=torch.float32)
+            s = float(wt.sum().item())
+            max_norm_w.append(float((wt / max(s, 1e-12)).max().item()))
+        else:
+            max_norm_w.append(float("nan"))
+        sel = r.get("selected_indices", [])
+        uniq_parents.append(len(set(int(i) for i in sel)) if sel else 0)
+        did_resample.append(bool(r.get("did_resample", False)))
+
+    fig, axes = plt.subplots(3, 1, figsize=figsize, sharex=True)
+
+    axes[0].plot(xs, ess_vals, marker="o", linewidth=1.4, alpha=0.9, label="ESS")
+    axes[0].set_ylabel("ESS")
+    axes[0].set_title(f"{title_prefix} - ESS")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="best", fontsize=8)
+
+    axes[1].plot(
+        xs, max_norm_w, marker="o", linewidth=1.4, alpha=0.9, color="tab:orange", label="max normalized weight"
+    )
+    axes[1].set_ylabel("max p(parent)")
+    axes[1].set_title(f"{title_prefix} - Selection concentration")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="best", fontsize=8)
+
+    axes[2].plot(
+        xs, uniq_parents, marker="o", linewidth=1.4, alpha=0.9, color="tab:green", label="unique selected parents"
+    )
+    for x, flag in zip(xs, did_resample):
+        if flag:
+            axes[2].axvline(x, color="gray", alpha=0.15, linewidth=1.0)
+    axes[2].set_ylabel("# unique parents")
+    axes[2].set_xlabel("Diffusion step index (sampling_idx)")
+    axes[2].set_title(f"{title_prefix} - Parent diversity")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(loc="best", fontsize=8)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig

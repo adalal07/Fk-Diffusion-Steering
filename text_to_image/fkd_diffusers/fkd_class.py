@@ -7,6 +7,8 @@ from enum import Enum
 import numpy as np
 from typing import Callable, List, Optional, Tuple
 import logging
+import json
+import os
 
 
 class PotentialType(Enum):
@@ -53,6 +55,8 @@ class FKD:
         device: torch.device = torch.device('cuda'),
         record_reward_history: bool = False,
         reward_history: Optional[List[dict]] = None,
+        include_terminal_resample: bool = True,
+        resampling_history_path: Optional[str] = None,
         **kwargs,
     ) -> None:
         # Initialize hyperparameters and functions
@@ -68,6 +72,7 @@ class FKD:
         self.resampling_t_start = resampling_t_start
         self.resampling_t_end = resampling_t_end
         self.time_steps = time_steps
+        self.include_terminal_resample = include_terminal_resample
 
         self.reward_fn = reward_fn
         self.latent_to_decode_fn = latent_to_decode_fn
@@ -91,6 +96,11 @@ class FKD:
             self.reward_history = reward_history if reward_history is not None else []
         else:
             self.reward_history = None
+        self.resampling_history_path = resampling_history_path
+        if self.resampling_history_path:
+            parent = os.path.dirname(self.resampling_history_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
 
     def resample(
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
@@ -111,7 +121,8 @@ class FKD:
         resampling_interval = np.arange(
             self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
         )
-        resampling_interval = np.append(resampling_interval, self.time_steps - 1)
+        if self.include_terminal_resample:
+            resampling_interval = np.append(resampling_interval, self.time_steps - 1)
 
         if sampling_idx not in resampling_interval:
             return latents, None
@@ -186,11 +197,14 @@ class FKD:
                 self.product_of_potentials = (
                     self.product_of_potentials[indices] * w[indices]
                 )
+                did_resample = True
             else:
                 # No resampling
                 resampled_images = population_images
                 resampled_latents = latents
                 self.population_rs = rs_candidates
+                indices = torch.arange(self.num_particles, device=self.device)
+                did_resample = False
 
         else:
             # Resample indices based on weights
@@ -207,6 +221,21 @@ class FKD:
             self.product_of_potentials = (
                 self.product_of_potentials[indices] * w[indices]
             )
+            ess = float("nan")
+            did_resample = True
+
+        if self.resampling_history_path:
+            rec = {
+                "sampling_idx": int(sampling_idx),
+                "did_resample": bool(did_resample),
+                "adaptive_resampling": bool(self.adaptive_resampling),
+                "ess": None if np.isnan(float(ess)) else float(ess),
+                "rewards": rs_candidates.detach().float().cpu().tolist(),
+                "weights": w.detach().float().cpu().tolist(),
+                "selected_indices": indices.detach().cpu().tolist(),
+            }
+            with open(self.resampling_history_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
         return resampled_latents, resampled_images
 
