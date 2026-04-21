@@ -57,6 +57,7 @@ class FKD:
         reward_history: Optional[List[dict]] = None,
         include_terminal_resample: bool = True,
         resampling_history_path: Optional[str] = None,
+        observe_only: bool = False,
         **kwargs,
     ) -> None:
         # Initialize hyperparameters and functions
@@ -73,6 +74,7 @@ class FKD:
         self.resampling_t_end = resampling_t_end
         self.time_steps = time_steps
         self.include_terminal_resample = include_terminal_resample
+        self.observe_only = bool(observe_only)
 
         self.reward_fn = reward_fn
         self.latent_to_decode_fn = latent_to_decode_fn
@@ -149,6 +151,19 @@ class FKD:
                     "min": float(rs_cpu.min().item()),
                 }
             )
+
+        if self.observe_only:
+            if self.resampling_history_path:
+                rec = {
+                    "sampling_idx": int(sampling_idx),
+                    "observe_only": True,
+                    "did_resample": False,
+                    "rewards": rs_candidates.detach().float().cpu().tolist(),
+                }
+                with open(self.resampling_history_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+            self.population_rs = rs_candidates
+            return latents, population_images
 
         # Compute importance weights
         if self.potential_type == PotentialType.MAX:

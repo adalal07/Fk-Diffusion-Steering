@@ -167,6 +167,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resampling-t-end", type=int, default=99)
     parser.add_argument("--use-smc", action="store_true", default=True)
     parser.add_argument("--disable-smc", action="store_true")
+    parser.add_argument(
+        "--record-baseline-trace",
+        action="store_true",
+        help=(
+            "When SMC is disabled, still decode x0 at resampling schedule, score with the "
+            "guidance reward, save per-step intermediates, and fill reward_history (no resampling)."
+        ),
+    )
     parser.add_argument("--include-terminal-resample", action="store_true", default=True)
 
     return parser.parse_args()
@@ -209,6 +217,8 @@ def make_reward_config_for_reward(
         cfg = make_qwen_reward_config(target)
         cfg["qwen_log_path"] = os.path.join(output_dir, "qwen_intermediate_logs.jsonl")
         return cfg
+    if reward_name == "VLMOCRScore":
+        return {"vlm_log_path": os.path.join(output_dir, "vlm_ocr_intermediate_logs.jsonl")}
     return {}
 
 
@@ -285,6 +295,7 @@ def main() -> None:
             "resampling_t_start": args.resampling_t_start,
             "resampling_t_end": args.resampling_t_end,
             "use_smc": args.use_smc,
+            "record_baseline_trace": bool(args.record_baseline_trace),
             "include_terminal_resample": args.include_terminal_resample,
         },
     }
@@ -306,6 +317,14 @@ def main() -> None:
             for prompt_idx, item in enumerate(prompts):
                 prompt_text = item["prompt"]
                 prompt_id = item.get("id", f"prompt-{prompt_idx:04d}")
+                prompt_slug = slugify_text(prompt_text)
+                prompt_folder_name = f"p{prompt_idx:04d}_{prompt_id}_{prompt_slug}"
+                prompt_intermediate_dir = os.path.join(inter_dir, prompt_folder_name)
+                trace_intermediate_dir = prompt_intermediate_dir
+                if not args.use_smc and args.record_baseline_trace:
+                    trace_intermediate_dir = os.path.join(
+                        prompt_intermediate_dir, "no_steering_trace"
+                    )
                 for repeat_idx in range(args.repeat_count):
                     per_run_seed = args.seed + prompt_idx * 10_000 + repeat_idx
                     torch.manual_seed(per_run_seed)
@@ -318,6 +337,7 @@ def main() -> None:
                         output_dir=output_dir,
                     )
 
+                    record_trace = bool(args.record_baseline_trace) and not args.use_smc
                     fkd_args = {
                         "lmbda": args.lmbda,
                         "num_particles": args.num_particles,
@@ -329,10 +349,12 @@ def main() -> None:
                         "resampling_t_end": args.resampling_t_end,
                         "guidance_reward_fn": guidance_reward_fn,
                         "use_smc": args.use_smc,
+                        "record_reward_trace": record_trace,
                         "reward_history": [],
-                        "record_reward_history": bool(args.use_smc),
+                        "record_reward_history": bool(args.use_smc or record_trace),
                         "include_terminal_resample": args.include_terminal_resample,
-                        "intermediate_images_dir": inter_dir,
+                        "intermediate_images_dir": trace_intermediate_dir,
+                        "run_output_dir": output_dir,
                         "reward_config": reward_config,
                     }
 
@@ -375,9 +397,7 @@ def main() -> None:
                     combo_stats[combo_key]["total"] += 1
                     elapsed_s = (datetime.now() - start_time).total_seconds()
 
-                    prompt_slug = slugify_text(prompt_text)
                     combo_slug = slugify_text(combo_key, max_len=40)
-                    prompt_folder_name = f"p{prompt_idx:04d}_{prompt_id}_{prompt_slug}"
                     prompt_image_dir = os.path.join(images_dir, prompt_folder_name)
                     prompt_plot_dir = os.path.join(plots_dir, prompt_folder_name)
                     os.makedirs(prompt_image_dir, exist_ok=True)
@@ -415,7 +435,12 @@ def main() -> None:
                             prompt_plot_dir,
                             f"{run_base_name}__reward-trace.png",
                         )
-                        plot_fkd_reward_trace(trace, title=f"{combo_key} | {prompt_id}", save_path=plot_path)
+                        trace_title = (
+                            f"{combo_key} | {prompt_id} (no steering, trace only)"
+                            if record_trace
+                            else f"{combo_key} | {prompt_id}"
+                        )
+                        plot_fkd_reward_trace(trace, title=trace_title, save_path=plot_path)
                         plt.close("all")
 
                     payload = {

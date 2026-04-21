@@ -18,7 +18,8 @@ from fkd_diffusers.rewards import (
     do_llm_grading,
     do_grounding_dino_spatial_reward,
     do_moondream_style_reward,
-    do_qwen3_vl_style_reward
+    do_qwen3_vl_style_reward,
+    do_vlm_ocr_score,
 )
 
 
@@ -159,6 +160,17 @@ def do_eval(*, prompt, images, metrics_to_compute, reward_config=None):
             results[metric]["std"] = std
             results[metric]["max"] = vmax
             results[metric]["min"] = vmin
+        elif metric == "VLMOCRScore":
+            results[metric] = {}
+            results[metric]["result"] = do_vlm_ocr_score(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
         else:
             raise ValueError(f"Unknown metric: {metric}")
 
@@ -186,6 +198,8 @@ def plot_fkd_reward_trace(
     ----------
     reward_history : list[dict] | None
         From ``fkd_args['reward_history']`` or ``pipeline._last_fkd.reward_history`` after a run.
+        The same structure is filled when ``fkd_args['record_reward_trace']`` is True with SMC off
+        (observe-only / no-resampling trace for baseline comparison).
     show_particles : bool
         If True, one line per particle (same prompt, different SMC particles).
     show_mean_band : bool

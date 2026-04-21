@@ -104,6 +104,7 @@ REWARDS_DICT = {
     "GroundingDINOSpatial": None,
     "MoonDreamStyle": None,
     "Qwen3VLStyle": None,
+    "VLMOCRScore": None,
 }
 
 
@@ -166,6 +167,13 @@ def get_reward_function(
             prompts=prompts,
             debug_overlay_dir=debug_overlay_dir,
             debug_sampling_idx=debug_sampling_idx,
+            **cfg,
+        )
+    elif reward_name == "VLMOCRScore":
+        cfg = dict(reward_config or {})
+        return do_vlm_ocr_score(
+            images=images,
+            prompts=prompts,
             **cfg,
         )
 
@@ -1397,6 +1405,318 @@ def _qwen3_vl_query_text(
         f"{rating_min} means not {style_target} at all. "
         "Output only the integer with no extra text."
     )
+
+
+def _vlm_ocr_query_text(
+    target_text: str,
+    reward_key: str,
+):
+    return (
+        "You are an OCR evaluator for generated-image text quality.\n"
+        f'TARGET_TEXT: "{target_text}"\n'
+        "Evaluate rendered text quality and return ONLY one JSON object with these keys:\n"
+        "{\n"
+        '  "detected_text": string,\n'
+        '  "exact_match_score": number,          // [0,1]\n'
+        '  "character_accuracy": number,         // [0,1]\n'
+        '  "legibility_score": number,           // [0,1]\n'
+        '  "completeness_score": number,         // [0,1]\n'
+        '  "extra_text_penalty": number,         // [0,1], larger is worse\n'
+        '  "layout_coherence": number,           // [0,1]\n'
+        f'  "{reward_key}": number,              // final reward in [0,1]\n'
+        '  "short_reason": string\n'
+        "}\n"
+        f'Use this formula exactly for "{reward_key}":\n'
+        f'{reward_key} = 0.40*exact_match_score + 0.25*character_accuracy + '
+        "0.15*legibility_score + 0.10*completeness_score + "
+        "0.10*layout_coherence - 0.20*extra_text_penalty\n"
+        f'Clamp "{reward_key}" to [0,1].\n'
+        "Do not include markdown fences or any extra text."
+    )
+
+
+def _vlm_ocr_numeric_query_text(
+    target_text: str,
+):
+    return (
+        "You are an OCR evaluator for generated-image text quality.\n"
+        f'TARGET_TEXT: "{target_text}"\n'
+        "Return only one number in [0,1] for how well the rendered image text matches TARGET_TEXT.\n"
+        "Scoring guidance:\n"
+        "- 1.0 means exact text match, highly legible, complete, no extra text.\n"
+        "- 0.0 means gibberish/unreadable/unrelated text.\n"
+        "Output format constraints:\n"
+        "- Output only the number.\n"
+        "- No words, no JSON, no markdown, no punctuation other than decimal point."
+    )
+
+
+def _extract_json_object(text: str):
+    if not text:
+        return None
+    text = str(text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        snippet = text[start : end + 1]
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _to_unit_interval_number(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return float(np.clip(v, 0.0, 1.0))
+
+
+def _extract_first_float(text: str):
+    if not text:
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group())
+    except ValueError:
+        return None
+
+
+def do_vlm_ocr_score(
+    *,
+    images,
+    prompts,
+    target_text=None,
+    include_prompt_context=True,
+    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_hf_device=None,
+    qwen_hf_device_map=None,
+    qwen_hf_dtype=None,
+    qwen_hf_max_memory=None,
+    qwen_hf_offload_folder=None,
+    qwen_hf_low_cpu_mem_usage=True,
+    qwen_tp_plan=None,
+    qwen_attn_implementation=None,
+    qwen_trust_remote_code=True,
+    qwen_force_reload=False,
+    hf_revision=None,
+    qwen_query_max_tokens=160,
+    qwen_do_sample=False,
+    qwen_temperature=0.0,
+    qwen_top_p=1.0,
+    qwen_debug_print=False,
+    vlm_log_enabled=True,
+    vlm_log_path=None,
+    vlm_log_to_output=True,
+    vlm_numeric_only_output=False,
+    reward_key="reward",
+    warn_parse_failures=True,
+    debug_sampling_idx=None,
+    **_unused_kwargs,
+):
+    """
+    Qwen3-VL OCR reward:
+    - asks for dense JSON feedback about text rendering quality
+    - can optionally use a numeric-only strict prompt
+    - logs full VLM output JSONL (toggleable)
+    - returns only scalar reward list in [0, 1]
+    """
+    global REWARDS_DICT
+
+    dtype = qwen_hf_dtype
+    if dtype is None:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    target_device = (
+        qwen_hf_device
+        if qwen_hf_device is not None
+        else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
+    device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    load_kw = {}
+    if hf_revision is not None:
+        load_kw["revision"] = hf_revision
+    cache_key = (
+        str(qwen_model_name),
+        str(hf_revision),
+        str(dtype),
+        str(target_device),
+        repr(device_map),
+        repr(qwen_hf_max_memory),
+        str(qwen_hf_offload_folder),
+        bool(qwen_hf_low_cpu_mem_usage),
+        str(qwen_tp_plan),
+        str(qwen_attn_implementation),
+        bool(qwen_trust_remote_code),
+    )
+    cached = REWARDS_DICT["VLMOCRScore"]
+    needs_reload = bool(qwen_force_reload) or cached is None or cached.get("cache_key") != cache_key
+    if needs_reload:
+        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
+        model_load_kw = dict(load_kw)
+        model_load_kw["device_map"] = device_map
+        model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
+        model_load_kw["low_cpu_mem_usage"] = bool(qwen_hf_low_cpu_mem_usage)
+        if qwen_hf_max_memory is not None:
+            model_load_kw["max_memory"] = qwen_hf_max_memory
+        if qwen_hf_offload_folder is not None:
+            model_load_kw["offload_folder"] = qwen_hf_offload_folder
+        if qwen_tp_plan is not None:
+            model_load_kw["tp_plan"] = qwen_tp_plan
+        if qwen_attn_implementation is not None:
+            model_load_kw["attn_implementation"] = qwen_attn_implementation
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                torch_dtype=dtype,
+                **model_load_kw,
+            )
+        except TypeError:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                dtype=dtype,
+                **model_load_kw,
+            )
+        if device_map is None:
+            model = model.to(target_device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
+        REWARDS_DICT["VLMOCRScore"] = {
+            "model_name": qwen_model_name,
+            "model": model,
+            "processor": processor,
+            "device": target_device,
+            "device_map": device_map,
+            "cache_key": cache_key,
+        }
+    cache_entry = REWARDS_DICT["VLMOCRScore"]
+    model = cache_entry["model"]
+    processor = cache_entry["processor"]
+    target_device = cache_entry["device"]
+    using_device_map = cache_entry["device_map"] is not None
+
+    effective_log_path = vlm_log_path
+    if bool(vlm_log_enabled) and effective_log_path is None and vlm_log_to_output:
+        effective_log_path = os.path.join("output", "vlm_ocr_intermediate_logs.jsonl")
+    if not bool(vlm_log_enabled):
+        effective_log_path = None
+
+    rewards = []
+    for i, image in enumerate(images):
+        image_prompt = prompts[i] if i < len(prompts) else ""
+        per_image_target_text = target_text if target_text is not None else image_prompt
+        if bool(vlm_numeric_only_output):
+            query_text = _vlm_ocr_numeric_query_text(
+                target_text=str(per_image_target_text),
+            )
+        else:
+            query_text = _vlm_ocr_query_text(
+                target_text=str(per_image_target_text),
+                reward_key=str(reward_key),
+            )
+        if include_prompt_context and image_prompt:
+            query_text = (
+                f"{query_text}\n"
+                f"Generation prompt context: {image_prompt}\n"
+                "Judge text rendered in the image against TARGET_TEXT."
+            )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": query_text},
+                ],
+            }
+        ]
+        prompt_for_model = query_text
+        if hasattr(processor, "apply_chat_template"):
+            try:
+                prompt_for_model = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt_for_model = query_text
+
+        inputs = processor(
+            text=[prompt_for_model],
+            images=[image],
+            return_tensors="pt",
+        )
+        if not using_device_map:
+            inputs = {k: v.to(target_device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=int(qwen_query_max_tokens),
+                do_sample=bool(qwen_do_sample),
+                temperature=float(qwen_temperature),
+                top_p=float(qwen_top_p),
+            )
+        answer = ""
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            generated_ids = generated[:, inputs["input_ids"].shape[-1] :]
+            answer = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+        if not answer:
+            answer = processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+
+        parsed = None
+        parsed_reward = None
+        if bool(vlm_numeric_only_output):
+            parsed_reward = _to_unit_interval_number(_extract_first_float(answer))
+        else:
+            parsed = _extract_json_object(answer)
+            if isinstance(parsed, dict):
+                parsed_reward = _to_unit_interval_number(parsed.get(str(reward_key)))
+                if parsed_reward is None:
+                    parsed_reward = _to_unit_interval_number(parsed.get("reward"))
+        reward = float(parsed_reward) if parsed_reward is not None else 0.0
+
+        if parsed_reward is None and warn_parse_failures:
+            warnings.warn(
+                f"VLMOCRScore: could not parse '{reward_key}' in [0,1] from answer={answer!r}; "
+                "using 0.0 reward.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if qwen_debug_print:
+            print(
+                "[VLMOCRScore] "
+                f"idx={i} target_text={per_image_target_text!r} parsed_reward={parsed_reward} "
+                f"reward={reward:.5f} raw_answer={answer[:220]!r}"
+            )
+        rewards.append(float(reward))
+
+        if effective_log_path:
+            log_parent = os.path.dirname(effective_log_path)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+            rec = {
+                "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
+                "particle_idx": int(i),
+                "target_text": str(per_image_target_text),
+                "query_text": str(query_text),
+                "raw_answer": str(answer),
+                "parsed_json": parsed if isinstance(parsed, dict) else None,
+                "reward_key": str(reward_key),
+                "reward": float(reward),
+            }
+            with open(effective_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+    return rewards
 
 
 def do_qwen3_vl_style_reward(

@@ -493,7 +493,13 @@ class FKDStableDiffusion(
 
         print('Args:', fkd_args)
         fkd = None
-        if fkd_args is not None and fkd_args['use_smc']:
+        _use_fkd = fkd_args is not None and (
+            bool(fkd_args.get("use_smc")) or bool(fkd_args.get("record_reward_trace"))
+        )
+        _observe_only = bool(fkd_args.get("record_reward_trace")) and not bool(
+            fkd_args.get("use_smc")
+        )
+        if _use_fkd:
             fkd_args.setdefault("reward_config", {})
             fkd_args["reward_config"]["temporal_state"] = {}
             fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
@@ -505,18 +511,31 @@ class FKDStableDiffusion(
                     "intermediate_images_dir",
                     os.path.join(run_output_dir, "intermediate"),
                 )
-                fkd_args.setdefault(
-                    "resampling_history_path",
-                    os.path.join(run_output_dir, "resampling_history.jsonl"),
-                )
+                if _observe_only:
+                    fkd_args.setdefault(
+                        "resampling_history_path",
+                        os.path.join(run_output_dir, "baseline_resampling_history.jsonl"),
+                    )
+                else:
+                    fkd_args.setdefault(
+                        "resampling_history_path",
+                        os.path.join(run_output_dir, "resampling_history.jsonl"),
+                    )
                 fkd_args["reward_config"].setdefault(
                     "qwen_log_path",
                     os.path.join(run_output_dir, "qwen_intermediate_logs.jsonl"),
                 )
+                fkd_args["reward_config"].setdefault(
+                    "vlm_log_path",
+                    os.path.join(run_output_dir, "vlm_ocr_intermediate_logs.jsonl"),
+                )
+            if fkd_args.get("record_reward_trace") and not fkd_args.get("use_smc"):
+                fkd_args.setdefault("record_reward_history", True)
             _fkd_kw = dict(fkd_args)
             _fkd_kw["device"] = (
                 device if isinstance(device, torch.device) else torch.device(device)
             )
+            _fkd_kw["observe_only"] = _observe_only
             if _fkd_kw.get("record_reward_history") and _fkd_kw.get("reward_history") is None:
                 _fkd_kw["reward_history"] = []
             fkd = FKD(
@@ -591,7 +610,7 @@ class FKDStableDiffusion(
                 x0_preds = step_dict["pred_original_sample"]
 
                 # FK Steering Change
-                if fkd_args is not None and fkd_args["use_smc"]:
+                if fkd is not None:
                     fkd_args.setdefault("reward_config", {})
                     fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
                     # Always expose current diffusion step to reward functions/loggers.
