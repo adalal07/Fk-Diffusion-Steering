@@ -11,6 +11,16 @@ import json
 import os
 
 
+def fk_steering_log(msg: str) -> None:
+    """Print/log without clobbering tqdm progress bars (uses ``tqdm.write`` when available)."""
+    try:
+        from tqdm.auto import tqdm
+
+        tqdm.write(msg)
+    except Exception:
+        print(msg, flush=True)
+
+
 class PotentialType(Enum):
     DIFF = "diff"
     MAX = "max"
@@ -104,6 +114,19 @@ class FKD:
             if parent:
                 os.makedirs(parent, exist_ok=True)
 
+    def _resampling_indices(self):
+        """Timestep indices where decode + reward_fn run (same logic as ``resample``)."""
+        resampling_interval = np.arange(
+            self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
+        )
+        if self.include_terminal_resample:
+            resampling_interval = np.append(resampling_interval, self.time_steps - 1)
+        return resampling_interval
+
+    def resampling_step_active(self, sampling_idx: int) -> bool:
+        """True iff this diffusion step will decode latents and evaluate the reward (can be very slow for VLMs)."""
+        return int(sampling_idx) in self._resampling_indices()
+
     def resample(
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -120,11 +143,7 @@ class FKD:
             A tuple containing resampled latents and optionally resampled images.
         """
         # Check if resampling is within the allowed range and conditions
-        resampling_interval = np.arange(
-            self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
-        )
-        if self.include_terminal_resample:
-            resampling_interval = np.append(resampling_interval, self.time_steps - 1)
+        resampling_interval = self._resampling_indices()
 
         if sampling_idx not in resampling_interval:
             return latents, None

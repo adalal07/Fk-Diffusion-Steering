@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import traceback
 from copy import deepcopy
 from datetime import datetime
 from itertools import product
@@ -214,7 +215,8 @@ def make_qwen3vl_spatial_reward_config(output_dir: str) -> Dict:
         "vlm_log_to_output": True,
         "vlm_log_path": os.path.join(output_dir, "vlm_spatial_awareness_logs.jsonl"),
         "qwen_model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct",
-        "qwen_hf_device_map": "auto",
+        # "auto" usually fills cuda:0 only when the model fits one GPU; "balanced" splits across visible devices.
+        "qwen_hf_device_map": "balanced",
         "qwen_hf_dtype": None,
         "qwen_hf_offload_folder": "output/hf_offload",
         "qwen_hf_low_cpu_mem_usage": True,
@@ -376,6 +378,8 @@ def main() -> None:
 
     combo_stats = {}
     score_path = os.path.join(output_dir, "scores.jsonl")
+    err_log_path = os.path.join(output_dir, "run_errors.log")
+    logged_pipeline_error_msgs: set[str] = set()
 
     with open(score_path, "w", encoding="utf-8") as score_f:
         for guidance_reward_fn, style_target in reward_combos:
@@ -434,6 +438,7 @@ def main() -> None:
                     start_time = datetime.now()
                     run_status = "ok"
                     error_msg = None
+                    error_tb = None
                     top_score = None
 
                     try:
@@ -462,9 +467,22 @@ def main() -> None:
                         results = {}
                         run_status = "error"
                         error_msg = str(exc)
+                        error_tb = traceback.format_exc()
                         combo_stats[combo_key]["errors"] += 1
                         combo_stats[combo_key]["failure"] += 1
                         images = []
+                        stamp = (
+                            f"{datetime.now().isoformat()} "
+                            f"combo={combo_key} prompt_idx={prompt_idx} repeat={repeat_idx} "
+                            f"seed={per_run_seed} prompt_id={prompt_id}"
+                        )
+                        with open(err_log_path, "a", encoding="utf-8") as ef:
+                            if error_msg not in logged_pipeline_error_msgs:
+                                logged_pipeline_error_msgs.add(error_msg)
+                                ef.write(f"\n--- first occurrence ---\n{stamp}\n{error_tb}")
+                                print(error_tb, file=sys.stderr, flush=True)
+                            else:
+                                ef.write(f"\n--- repeat ({error_msg[:120]}...) ---\n{stamp}\n")
 
                     combo_stats[combo_key]["total"] += 1
                     elapsed_s = (datetime.now() - start_time).total_seconds()
@@ -557,6 +575,12 @@ def main() -> None:
         )
 
     print(json.dumps(summary, indent=2))
+    if logged_pipeline_error_msgs:
+        print(
+            f"Pipeline errors logged with tracebacks (first occurrence each): {err_log_path}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

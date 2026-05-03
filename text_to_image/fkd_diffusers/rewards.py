@@ -95,6 +95,7 @@ def _ensure_hpsv2_open_clip_vocab():
     )
 
 from llm_grading import LLMGrader
+from fkd_class import fk_steering_log
 
 # Stores the reward models
 REWARDS_DICT = {
@@ -1417,8 +1418,9 @@ def _import_qwen3_vl_hf():
         from transformers import AutoModelForImageTextToText, AutoProcessor
     except ImportError as e:
         raise ImportError(
-            "Qwen3VLStyle requires a recent `transformers` with vision-language "
-            "generation support. Install: pip install -U 'transformers>=4.51' accelerate"
+            "Qwen3-VL rewards require a recent `transformers` with "
+            "`AutoModelForImageTextToText` (vision-language generation). "
+            "Install: pip install -U 'transformers>=4.51' accelerate"
         ) from e
     return AutoModelForImageTextToText, AutoProcessor
 
@@ -1553,6 +1555,11 @@ def _extract_json_object(text: str):
     if not text:
         return None
     text = str(text).strip()
+    # Markdown fences (models often wrap JSON despite instructions).
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        if m:
+            text = m.group(1).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -1921,7 +1928,7 @@ def do_vlm_color_binding_score(
     color_object_pairs=None,
     use_legacy_prompt_parser=False,
     include_prompt_context=True,
-    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_model_name="Qwen/Qwen3-VL-2B-Instruct",
     qwen_hf_device=None,
     qwen_hf_device_map=None,
     qwen_hf_dtype=None,
@@ -2424,7 +2431,14 @@ def do_qwen3_vl_spatial_awareness_reward(
         if qwen_hf_device is not None
         else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
-    device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    # ``device_map="auto"`` often loads the *whole* checkpoint onto cuda:0 when VRAM fits (common on 80GB cards).
+    # Default ``balanced`` spreads weights across visible GPUs; override with ``qwen_hf_device_map`` / ``qwen_hf_max_memory``.
+    if qwen_hf_device_map is not None:
+        device_map = qwen_hf_device_map
+    elif torch.cuda.is_available():
+        device_map = "balanced"
+    else:
+        device_map = None
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
@@ -2507,7 +2521,13 @@ def do_qwen3_vl_spatial_awareness_reward(
         )
 
     rewards = []
+    n_particles = len(images) if images is not None else 0
     for i, image in enumerate(images):
+        if not os.environ.get("FKD_QUIET_SPATIAL_PARTICLE_LOG"):
+            fk_steering_log(
+                f"[Qwen3VLSpatial] Particle {i + 1}/{n_particles}: running VLM forward "
+                f"(main diffusion tqdm stays frozen until all {n_particles} are scored)."
+            )
         image_prompt = prompts[i] if i < len(prompts) else ""
         user_txt = _vlm_spatial_user_instruction(image_prompt)
         if include_prompt_context and str(image_prompt).strip():
@@ -2526,7 +2546,6 @@ def do_qwen3_vl_spatial_awareness_reward(
                 ],
             },
         ]
-        prompt_for_model = user_txt
         prompt_for_model = f"{sys_txt}\n\n{user_txt}"
         if hasattr(processor, "apply_chat_template"):
             try:
@@ -2665,7 +2684,7 @@ def do_vlm_ocr_score(
     prompts,
     target_text=None,
     include_prompt_context=True,
-    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_model_name="Qwen/Qwen3-VL-2B-Instruct",
     qwen_hf_device=None,
     qwen_hf_device_map=None,
     qwen_hf_dtype=None,
@@ -2906,7 +2925,7 @@ def do_vlm_ocr_score_v2(
     prompts,
     target_text=None,
     include_prompt_context=True,
-    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_model_name="Qwen/Qwen3-VL-2B-Instruct",
     qwen_hf_device=None,
     qwen_hf_device_map=None,
     qwen_hf_dtype=None,
@@ -3218,7 +3237,7 @@ def do_qwen3_vl_style_reward(
     *,
     images,
     prompts,
-    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_model_name="Qwen/Qwen3-VL-2B-Instruct",
     qwen_hf_device=None,
     qwen_hf_device_map=None,
     qwen_hf_dtype=None,

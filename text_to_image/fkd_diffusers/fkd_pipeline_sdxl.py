@@ -17,7 +17,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 # Added for FK Steering
-from fkd_class import FKD
+from fkd_class import FKD, fk_steering_log
 from rewards import get_reward_function
 
 import torch
@@ -846,6 +846,14 @@ class FKDStableDiffusionXL(
                         fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
                             "moondream_overlay_dir"
                         ]
+                    if fkd.resampling_step_active(i) and not os.environ.get(
+                        "FKD_QUIET_FKD_STEP_LOG"
+                    ):
+                        fn = (fkd_args or {}).get("guidance_reward_fn") or ""
+                        fk_steering_log(
+                            f"[FKD] Denoising index i={i} (of {len(timesteps)} steps): evaluating reward "
+                            f"'{fn}'. The main tqdm bar does not advance until this finishes — VLMs can take minutes."
+                        )
                     latents, current_pop_images = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
                     )
