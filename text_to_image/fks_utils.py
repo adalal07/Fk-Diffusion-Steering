@@ -20,6 +20,8 @@ from fkd_diffusers.rewards import (
     do_moondream_style_reward,
     do_qwen3_vl_style_reward,
     do_vlm_ocr_score,
+    do_vlm_ocr_score_v2,
+    do_vlm_color_binding_score,
 )
 
 
@@ -163,6 +165,28 @@ def do_eval(*, prompt, images, metrics_to_compute, reward_config=None):
         elif metric == "VLMOCRScore":
             results[metric] = {}
             results[metric]["result"] = do_vlm_ocr_score(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
+        elif metric == "VLMOCRScoreV2":
+            results[metric] = {}
+            results[metric]["result"] = do_vlm_ocr_score_v2(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
+        elif metric == "VLMColorBinding":
+            results[metric] = {}
+            results[metric]["result"] = do_vlm_color_binding_score(
                 images=images, prompts=prompt, **reward_config
             )
 

@@ -105,6 +105,8 @@ REWARDS_DICT = {
     "MoonDreamStyle": None,
     "Qwen3VLStyle": None,
     "VLMOCRScore": None,
+    "VLMOCRScoreV2": None,
+    "VLMColorBinding": None,
 }
 
 
@@ -172,6 +174,20 @@ def get_reward_function(
     elif reward_name == "VLMOCRScore":
         cfg = dict(reward_config or {})
         return do_vlm_ocr_score(
+            images=images,
+            prompts=prompts,
+            **cfg,
+        )
+    elif reward_name == "VLMOCRScoreV2":
+        cfg = dict(reward_config or {})
+        return do_vlm_ocr_score_v2(
+            images=images,
+            prompts=prompts,
+            **cfg,
+        )
+    elif reward_name == "VLMColorBinding":
+        cfg = dict(reward_config or {})
+        return do_vlm_color_binding_score(
             images=images,
             prompts=prompts,
             **cfg,
@@ -1393,6 +1409,48 @@ def _import_qwen3_vl_hf():
     return AutoModelForImageTextToText, AutoProcessor
 
 
+def _resolve_generation_device(model, target_device, using_device_map):
+    """
+    Best-effort device to place generation inputs on.
+    """
+    if not using_device_map:
+        try:
+            return torch.device(target_device)
+        except Exception:
+            return None
+    try:
+        md = getattr(model, "device", None)
+        if md is not None:
+            md = torch.device(md)
+            if md.type != "meta":
+                return md
+    except Exception:
+        pass
+    try:
+        first_param = next(model.parameters())
+        pd = first_param.device
+        if pd.type != "meta":
+            return pd
+    except Exception:
+        pass
+    return None
+
+
+def _move_generation_inputs(inputs, generation_device):
+    if generation_device is None:
+        return inputs
+    moved = {}
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            try:
+                moved[k] = v.to(generation_device)
+            except Exception:
+                moved[k] = v
+        else:
+            moved[k] = v
+    return moved
+
+
 def _qwen3_vl_query_text(
     style_target: str,
     rating_min: int,
@@ -1407,13 +1465,37 @@ def _qwen3_vl_query_text(
     )
 
 
+def _extract_target_string_to_match(prompt_text: str) -> str:
+    """
+    Best-effort extraction of the literal text string the image should render.
+    Falls back to the full prompt text if no quoted target is found.
+    """
+    s = str(prompt_text or "").strip()
+    if not s:
+        return ""
+    # Prefer patterns like: word 'TICKETS', reads "TOKYO", says 'Latte'
+    patt = re.search(
+        r"(?i)(?:word|reads?|says?|spells?|display(?:s|ing)?)(?:\s+the\s+word)?\s*['\"“”‘’]([^'\"“”‘’]{1,80})['\"“”‘’]",
+        s,
+    )
+    if patt:
+        return patt.group(1).strip()
+    # Fallback: any quoted span.
+    quoted = re.search(r"['\"“”‘’]([^'\"“”‘’]{1,80})['\"“”‘’]", s)
+    if quoted:
+        return quoted.group(1).strip()
+    return s
+
+
 def _vlm_ocr_query_text(
-    target_text: str,
+    target_string_to_match: str,
     reward_key: str,
+    generation_context: str = "",
 ):
     return (
         "You are an OCR evaluator for generated-image text quality.\n"
-        f'TARGET_TEXT: "{target_text}"\n'
+        f'GENERATION_CONTEXT: "{generation_context}"\n'
+        f'TARGET_STRING_TO_MATCH: "{target_string_to_match}"\n'
         "Evaluate rendered text quality and return ONLY one JSON object with these keys:\n"
         "{\n"
         '  "detected_text": string,\n'
@@ -1436,12 +1518,14 @@ def _vlm_ocr_query_text(
 
 
 def _vlm_ocr_numeric_query_text(
-    target_text: str,
+    target_string_to_match: str,
+    generation_context: str = "",
 ):
     return (
         "You are an OCR evaluator for generated-image text quality.\n"
-        f'TARGET_TEXT: "{target_text}"\n'
-        "Return only one number in [0,1] for how well the rendered image text matches TARGET_TEXT.\n"
+        f'GENERATION_CONTEXT: "{generation_context}"\n'
+        f'TARGET_STRING_TO_MATCH: "{target_string_to_match}"\n'
+        "Return only one number in [0,1] for how well rendered image text matches TARGET_STRING_TO_MATCH.\n"
         "Scoring guidance:\n"
         "- 1.0 means exact text match, highly legible, complete, no extra text.\n"
         "- 0.0 means gibberish/unreadable/unrelated text.\n"
@@ -1488,6 +1572,630 @@ def _extract_first_float(text: str):
         return float(m.group())
     except ValueError:
         return None
+
+
+def _vlm_ocr_v2_query_text(target_string_to_match: str, generation_context: str = ""):
+    return (
+        "You are a strict OCR + layout + visual quality evaluator for generated images.\n"
+        f'GENERATION_CONTEXT: "{generation_context}"\n'
+        f'TARGET_STRING_TO_MATCH: "{target_string_to_match}"\n'
+        "Return ONLY one JSON object with exactly these keys:\n"
+        "{\n"
+        '  "detected_text": string,\n'
+        '  "legibility_score": number,               // [0,1]\n'
+        '  "completeness_score": number,             // [0,1]\n'
+        '  "extra_text_penalty": number,             // [0,1], larger = worse\n'
+        '  "region_match_score": number,             // [0,1], text appears on intended object/surface\n'
+        '  "alignment_score": number,                // [0,1], orientation/placement coherence\n'
+        '  "coverage_score": number,                 // [0,1], text size is appropriate (not tiny/cropped)\n'
+        '  "visual_quality_score": number,           // [0,1], overall image quality\n'
+        '  "extra_objects_penalty": number,          // [0,1], salient unprompted objects/duplicates\n'
+        '  "short_reason": string\n'
+        "}\n"
+        "Rules:\n"
+        "- Use numbers in [0,1] for all *_score / *_penalty fields.\n"
+        "- detected_text should be your best OCR read.\n"
+        "- No markdown, no extra prose outside the JSON object.\n"
+    )
+
+
+def _normalize_ocr_text(s: str) -> str:
+    s = str(s or "").strip().upper()
+    return re.sub(r"[^A-Z0-9]+", "", s)
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cur.append(min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (0 if ca == cb else 1)))
+        prev = cur
+    return prev[-1]
+
+
+# --- Compositional color–object binding (VLM) --------------------------------
+
+_DEFAULT_COLOR_WORDS = frozenset(
+    {
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "orange",
+        "purple",
+        "pink",
+        "brown",
+        "black",
+        "white",
+        "gray",
+        "grey",
+        "silver",
+        "gold",
+        "cyan",
+        "magenta",
+        "teal",
+        "navy",
+        "maroon",
+        "beige",
+        "tan",
+        "lavender",
+        "violet",
+        "indigo",
+        "turquoise",
+        "crimson",
+        "coral",
+        "salmon",
+        "lime",
+        "olive",
+        "azure",
+        "burgundy",
+        "charcoal",
+        "cream",
+        "ivory",
+        "khaki",
+        "mint",
+        "rose",
+    }
+)
+
+
+def _strip_leading_photo_prefix(text: str) -> str:
+    return re.sub(r"(?i)^\s*a\s+photo\s+of\s+", "", text.strip()).strip()
+
+
+def _pair_from_article_color_noun(segment: str):
+    segment = segment.strip().rstrip(".")
+    m = re.match(r"(?i)^(?:a|an|the)\s+([a-zA-Z]+)\s+(.+)$", segment)
+    if not m:
+        return None
+    color_w = m.group(1).lower()
+    rest = m.group(2).strip()
+    if color_w not in _DEFAULT_COLOR_WORDS:
+        return None
+    return (m.group(1), rest)
+
+
+def parse_color_object_pairs(prompt: str) -> list[tuple[str, str]]:
+    """
+    Optional legacy heuristic: (color, object phrase) pairs for debugging or when
+    ``use_legacy_prompt_parser`` is enabled on ``VLMColorBinding``.
+    Default scoring lets the VLM decompose the prompt—no regex parse required.
+    """
+    s = _strip_leading_photo_prefix(prompt)
+    pairs: list[tuple[str, str]] = []
+
+    m_in = re.match(
+        r"(?i)^(?P<left>.+?)\s+in\s+a\s+(?P<right>(?:a|an|the)\s+.+)$",
+        s.strip(),
+    )
+    if m_in:
+        for seg in (m_in.group("left"), m_in.group("right")):
+            p = _pair_from_article_color_noun(seg)
+            if p:
+                pairs.append(p)
+        if pairs:
+            return pairs
+
+    parts = re.split(r"(?i)\s+and\s+|\s+with\s+", s)
+    for seg in parts:
+        p = _pair_from_article_color_noun(seg)
+        if p:
+            pairs.append(p)
+    return pairs
+
+
+def _vlm_color_binding_query_text(pairs: list[tuple[str, str]]) -> str:
+    lines = [
+        "You judge whether a synthetic image satisfies COLOR–OBJECT binding constraints.",
+        "Each constraint is independent. Score how well the named object appears in the stated color",
+        "(main recognizable surface color of that object). Ignore unrelated background unless it is the named object.",
+        "",
+        "Also judge EXTRANEOUS CONTENT: salient objects or duplicate instances that the prompt does NOT require",
+        "(e.g. an extra donut when only one was asked for). ",
+        "extraneous_content_penalty must be in [0,1]: 0 = no meaningful extra unprompted objects; ",
+        "1 = clear extra major objects or duplicates that distract from the requested scene.",
+        "",
+        "Constraints:",
+    ]
+    for i, (color, obj_phrase) in enumerate(pairs, start=1):
+        lines.append(
+            f'{i}. Object: "{obj_phrase}" — should appear predominantly {color} (not swapped with another object).'
+        )
+    lines.extend(
+        [
+            "",
+            "Return ONLY one JSON object (no markdown) with exactly these keys:",
+            '{',
+            '  "pair_scores": [ number, ... ],  // one entry per constraint above, each in [0,1]',
+            '  "extraneous_content_penalty": number,  // [0,1], see above',
+            '  "notes": string',
+            "}",
+            "",
+            "Use 1.0 only if binding is clearly correct; 0.0 if wrong color, missing object, or swapped colors.",
+            "Use intermediate values if ambiguous.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _vlm_color_binding_full_prompt_query(image_generation_prompt: str) -> str:
+    """
+    Single-shot rubric: the VLM reads the raw prompt, decides how many color-binding
+    constraints apply, scores each in [0,1], and we take the mean (max 1.0).
+    No separate parser—reduces failure modes from brittle regex.
+    """
+    # Escape minimal risk of the model treating braces as template—prompt is plain text.
+    p = (image_generation_prompt or "").strip()
+    return (
+        "You are a strict visual judge for COLOR BINDING in text-to-image generation.\n\n"
+        "IMAGE_GENERATION_PROMPT (the instruction used to generate the picture):\n"
+        f'"""{p}"""\n\n'
+        "Steps:\n"
+        "1) Read IMAGE_GENERATION_PROMPT and identify every distinct requirement where a "
+        "specific color should apply to a specific object, region, or labeled thing "
+        "(e.g. 'blue donut', 'brown knife', 'green stop sign', 'red field').\n"
+        "   - Split compound prompts into separate constraints (e.g. two objects with two colors → two constraints).\n"
+        "   - If the prompt does not mention any color–target pairing, use an empty constraints list.\n"
+        "2) For each constraint, score how well the image satisfies that pairing alone:\n"
+        "   - 1.0: the named target is clearly visible and its main/salient color matches.\n"
+        "   - 0.0: wrong color on that target, missing target, or colors clearly swapped between named objects.\n"
+        "   - Values between 0 and 1 only if genuinely ambiguous (partial visibility, lighting, etc.).\n"
+        "3) EXTRANEOUS CONTENT: score salient objects or duplicate instances that IMAGE_GENERATION_PROMPT does NOT ask for\n"
+        "   (e.g. a second donut when the prompt only mentions one donut and a knife). "
+        "Set extraneous_content_penalty in [0,1]: 0 = no meaningful extra unprompted objects; "
+        "1 = strong distraction from clearly extra major objects or duplicates.\n"
+        "4) Base binding score = arithmetic mean of per-constraint \"score\" values (equal weight).\n"
+        "   (The caller combines base score with extraneous_content_penalty; describe both honestly.)\n\n"
+        "Return ONLY one JSON object (no markdown, no code fences) with exactly these keys:\n"
+        "{\n"
+        '  "constraints": [\n'
+        '    { "color": string, "target": string, "score": number },\n'
+        "    ...\n"
+        "  ],\n"
+        '  "extraneous_content_penalty": number,\n'
+        '  "notes": string\n'
+        "}\n"
+        "Rules:\n"
+        '- Each constraint "score" must be in [0,1].\n'
+        '- "extraneous_content_penalty" must be in [0,1].\n'
+        '- "target" is a short phrase for what must have that color (object or region).\n'
+        '- The list order should match the order constraints appear in the prompt when reasonable.\n'
+        "- If there are zero color-binding constraints, return \"constraints\": [] and still rate extraneous_content_penalty if applicable.\n"
+    )
+
+
+def _vlm_color_binding_reward_from_json(
+    parsed,
+    *,
+    expected_n_pairs: int | None,
+    warn_parse_failures: bool,
+    answer: str,
+    extra_items_penalty_weight: float = 1.0,
+    reward_min: float = -1.0,
+    reward_max: float = 1.0,
+) -> tuple[float, list[tuple[str, str]] | None, dict]:
+    """
+    Compute reward from VLM JSON. Prefers ``constraints[].score``; falls back to ``pair_scores``.
+
+    Final reward = clip(
+        mean(scores) - extra_items_penalty_weight * extraneous_content_penalty,
+        reward_min,
+        reward_max,
+    ).
+    When ``expected_n_pairs`` is set (explicit / legacy numbered constraints), only averages
+    the first ``expected_n_pairs`` entries in ``pair_scores`` if ``constraints`` is absent.
+
+    Returns ``(reward, labels | None, meta)`` where ``meta`` has base mean, penalty, and weights for logging.
+    """
+    if not isinstance(parsed, dict):
+        return 0.0, None, {}
+    nums: list[float] = []
+    labels: list[tuple[str, str]] = []
+
+    raw_constraints = parsed.get("constraints")
+    if isinstance(raw_constraints, list):
+        for c in raw_constraints:
+            if not isinstance(c, dict):
+                continue
+            v = _to_unit_interval_number(c.get("score"))
+            if v is not None:
+                nums.append(v)
+            col = str(c.get("color", "") or "").strip()
+            tgt = str(c.get("target", "") or "").strip()
+            if col or tgt:
+                labels.append((col, tgt))
+
+    if not nums:
+        raw_scores = parsed.get("pair_scores")
+        if isinstance(raw_scores, list):
+            limit = len(raw_scores)
+            if expected_n_pairs is not None:
+                limit = min(limit, int(expected_n_pairs))
+            for x in raw_scores[:limit]:
+                v = _to_unit_interval_number(x)
+                if v is not None:
+                    nums.append(v)
+
+    if not nums:
+        if warn_parse_failures:
+            warnings.warn(
+                "VLMColorBinding: could not read constraint scores from JSON "
+                f"(need non-empty \"constraints\" with scores or \"pair_scores\"); "
+                f"answer={answer[:300]!r}",
+                UserWarning,
+                stacklevel=2,
+            )
+        return 0.0, (labels or None), {"base_mean": 0.0, "extraneous_penalty": None, "extra_items_penalty_weight": float(extra_items_penalty_weight)}
+
+    base_mean = float(np.mean(nums))
+    pen_raw = parsed.get("extraneous_content_penalty")
+    if pen_raw is None:
+        pen_raw = parsed.get("extra_objects_penalty")
+    pen_v = 0.0
+    if pen_raw is not None:
+        pv = _to_unit_interval_number(pen_raw)
+        if pv is not None:
+            pen_v = float(pv)
+        elif warn_parse_failures:
+            warnings.warn(
+                f"VLMColorBinding: could not parse extraneous_content_penalty from {pen_raw!r}; using 0.",
+                UserWarning,
+                stacklevel=2,
+            )
+    w = float(extra_items_penalty_weight)
+    if reward_min > reward_max:
+        raise ValueError("VLMColorBinding: reward_min must be <= reward_max.")
+    reward = float(np.clip(base_mean - w * float(pen_v), float(reward_min), float(reward_max)))
+
+    if (
+        expected_n_pairs is not None
+        and isinstance(parsed.get("pair_scores"), list)
+        and not isinstance(raw_constraints, list)
+        and len(nums) != int(expected_n_pairs)
+        and warn_parse_failures
+    ):
+        warnings.warn(
+            f"VLMColorBinding: expected {expected_n_pairs} pair_scores, got {len(parsed['pair_scores'])}; "
+            f"averaged {len(nums)} values.",
+            UserWarning,
+            stacklevel=2,
+        )
+    meta = {
+        "base_mean": base_mean,
+        "extraneous_penalty": float(pen_v),
+        "extra_items_penalty_weight": w,
+        "reward_after_penalty": reward,
+        "reward_min": float(reward_min),
+        "reward_max": float(reward_max),
+    }
+    return reward, (labels or None), meta
+
+
+def do_vlm_color_binding_score(
+    *,
+    images,
+    prompts,
+    color_object_pairs=None,
+    use_legacy_prompt_parser=False,
+    include_prompt_context=True,
+    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_hf_device=None,
+    qwen_hf_device_map=None,
+    qwen_hf_dtype=None,
+    qwen_hf_max_memory=None,
+    qwen_hf_offload_folder=None,
+    qwen_hf_low_cpu_mem_usage=True,
+    qwen_tp_plan=None,
+    qwen_attn_implementation=None,
+    qwen_trust_remote_code=True,
+    qwen_force_reload=False,
+    hf_revision=None,
+    qwen_query_max_tokens=320,
+    qwen_do_sample=False,
+    qwen_temperature=0.0,
+    qwen_top_p=1.0,
+    qwen_debug_print=False,
+    vlm_log_enabled=True,
+    vlm_log_path=None,
+    vlm_log_to_output=True,
+    warn_parse_failures=True,
+    debug_sampling_idx=None,
+    extra_items_penalty_weight=1.0,
+    reward_min=-1.0,
+    reward_max=1.0,
+    **_unused_kwargs,
+):
+    """
+    VLM reward for compositional color prompts: target reward is in ``[0,1]``.
+
+    **Default:** no regex parsing—the rubric asks the VLM to read the full generation
+    prompt, list color→target constraints, score each in ``[0,1]``, and you take the
+    mean (equal weight per constraint).
+
+    **Extraneous items:** the rubric asks for ``extraneous_content_penalty`` in ``[0,1]``.
+    Final reward = clip(
+        mean(constraint scores) - ``extra_items_penalty_weight`` × penalty,
+        ``reward_min``,
+        ``reward_max``,
+    ).
+
+    **Optional:** ``color_object_pairs`` supplies fixed constraints (skips VLM
+    decomposition of the text). **Legacy:** ``use_legacy_prompt_parser=True`` restores
+    heuristic ``parse_color_object_pairs`` + numbered constraint prompts.
+    """
+    global REWARDS_DICT
+
+    dtype = qwen_hf_dtype
+    if dtype is None:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    target_device = (
+        qwen_hf_device
+        if qwen_hf_device is not None
+        else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
+    device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    load_kw = {}
+    if hf_revision is not None:
+        load_kw["revision"] = hf_revision
+    cache_key = (
+        str(qwen_model_name),
+        str(hf_revision),
+        str(dtype),
+        str(target_device),
+        repr(device_map),
+        repr(qwen_hf_max_memory),
+        str(qwen_hf_offload_folder),
+        bool(qwen_hf_low_cpu_mem_usage),
+        str(qwen_tp_plan),
+        str(qwen_attn_implementation),
+        bool(qwen_trust_remote_code),
+    )
+    cached = REWARDS_DICT["VLMColorBinding"]
+    needs_reload = bool(qwen_force_reload) or cached is None or cached.get("cache_key") != cache_key
+    if needs_reload:
+        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
+        model_load_kw = dict(load_kw)
+        model_load_kw["device_map"] = device_map
+        model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
+        model_load_kw["low_cpu_mem_usage"] = bool(qwen_hf_low_cpu_mem_usage)
+        if qwen_hf_max_memory is not None:
+            model_load_kw["max_memory"] = qwen_hf_max_memory
+        if qwen_hf_offload_folder is not None:
+            model_load_kw["offload_folder"] = qwen_hf_offload_folder
+        if qwen_tp_plan is not None:
+            model_load_kw["tp_plan"] = qwen_tp_plan
+        if qwen_attn_implementation is not None:
+            model_load_kw["attn_implementation"] = qwen_attn_implementation
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                torch_dtype=dtype,
+                **model_load_kw,
+            )
+        except TypeError:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                dtype=dtype,
+                **model_load_kw,
+            )
+        if device_map is None:
+            model = model.to(target_device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
+        REWARDS_DICT["VLMColorBinding"] = {
+            "model_name": qwen_model_name,
+            "model": model,
+            "processor": processor,
+            "device": target_device,
+            "device_map": device_map,
+            "cache_key": cache_key,
+        }
+    cache_entry = REWARDS_DICT["VLMColorBinding"]
+    model = cache_entry["model"]
+    processor = cache_entry["processor"]
+    target_device = cache_entry["device"]
+    using_device_map = cache_entry["device_map"] is not None
+
+    effective_log_path = vlm_log_path
+    if bool(vlm_log_enabled) and effective_log_path is None and vlm_log_to_output:
+        effective_log_path = os.path.join("output", "vlm_color_binding_logs.jsonl")
+    if not bool(vlm_log_enabled):
+        effective_log_path = None
+
+    rewards = []
+    for i, image in enumerate(images):
+        image_prompt = prompts[i] if i < len(prompts) else ""
+        pairs: list[tuple[str, str]] = []
+        expected_n: int | None = None
+
+        if color_object_pairs is not None:
+            for entry in color_object_pairs:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    pairs.append((str(entry[0]).strip(), str(entry[1]).strip()))
+            if not pairs:
+                if warn_parse_failures:
+                    warnings.warn(
+                        "VLMColorBinding: color_object_pairs was empty; using 0.0.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                rewards.append(0.0)
+                continue
+            query_text = _vlm_color_binding_query_text(pairs)
+            expected_n = len(pairs)
+            if include_prompt_context and image_prompt:
+                query_text = (
+                    f"{query_text}\n\n"
+                    f"Generation prompt (full): {image_prompt}\n"
+                    "Evaluate the image against the numbered constraints above."
+                )
+        elif use_legacy_prompt_parser:
+            pairs = parse_color_object_pairs(image_prompt)
+            if not pairs:
+                if warn_parse_failures:
+                    warnings.warn(
+                        f"VLMColorBinding: legacy parser found no pairs in prompt={image_prompt!r}; "
+                        "using 0.0. Disable use_legacy_prompt_parser for VLM-only decomposition.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                rewards.append(0.0)
+                continue
+            query_text = _vlm_color_binding_query_text(pairs)
+            expected_n = len(pairs)
+            if include_prompt_context and image_prompt:
+                query_text = (
+                    f"{query_text}\n\n"
+                    f"Generation prompt (full): {image_prompt}\n"
+                    "Evaluate the image against the constraints above."
+                )
+        else:
+            if not str(image_prompt).strip():
+                if warn_parse_failures:
+                    warnings.warn(
+                        "VLMColorBinding: empty prompt; using 0.0.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                rewards.append(0.0)
+                continue
+            query_text = _vlm_color_binding_full_prompt_query(image_prompt)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": query_text},
+                ],
+            }
+        ]
+        prompt_for_model = query_text
+        if hasattr(processor, "apply_chat_template"):
+            try:
+                prompt_for_model = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt_for_model = query_text
+
+        inputs = processor(
+            text=[prompt_for_model],
+            images=[image],
+            return_tensors="pt",
+        )
+        generation_device = _resolve_generation_device(
+            model=model,
+            target_device=target_device,
+            using_device_map=using_device_map,
+        )
+        inputs = _move_generation_inputs(inputs, generation_device)
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=int(qwen_query_max_tokens),
+                do_sample=bool(qwen_do_sample),
+                temperature=float(qwen_temperature),
+                top_p=float(qwen_top_p),
+            )
+        answer = ""
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            generated_ids = generated[:, inputs["input_ids"].shape[-1] :]
+            answer = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+        if not answer:
+            answer = processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+
+        parsed = _extract_json_object(answer)
+        penalty_meta: dict = {}
+        if isinstance(parsed, dict):
+            reward, vlm_labels, penalty_meta = _vlm_color_binding_reward_from_json(
+                parsed,
+                expected_n_pairs=expected_n,
+                warn_parse_failures=warn_parse_failures,
+                answer=answer,
+                extra_items_penalty_weight=float(extra_items_penalty_weight),
+                reward_min=float(reward_min),
+                reward_max=float(reward_max),
+            )
+        else:
+            reward, vlm_labels = 0.0, None
+            if warn_parse_failures:
+                warnings.warn(
+                    f"VLMColorBinding: could not parse JSON object from answer={answer[:300]!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        final_r = float(np.clip(reward, float(reward_min), float(reward_max)))
+        rewards.append(final_r)
+
+        log_pairs = [list(p) for p in pairs] if pairs else (
+            [list(x) for x in vlm_labels] if vlm_labels else []
+        )
+
+        if qwen_debug_print:
+            print(
+                f"[VLMColorBinding] idx={i} pairs={log_pairs!r} reward={final_r:.5f} raw_answer={answer[:220]!r}"
+            )
+
+        if effective_log_path:
+            log_parent = os.path.dirname(effective_log_path)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+            rec = {
+                "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
+                "particle_idx": int(i),
+                "prompt": str(image_prompt),
+                "pairs": log_pairs,
+                "vlm_decomposed_labels": [list(x) for x in vlm_labels] if vlm_labels else None,
+                "query_text": str(query_text),
+                "raw_answer": str(answer),
+                "parsed_json": parsed if isinstance(parsed, dict) else None,
+                "reward": final_r,
+                "reward_base_mean": penalty_meta.get("base_mean"),
+                "extraneous_content_penalty": penalty_meta.get("extraneous_penalty"),
+                "extra_items_penalty_weight": penalty_meta.get("extra_items_penalty_weight"),
+                "reward_min": penalty_meta.get("reward_min", float(reward_min)),
+                "reward_max": penalty_meta.get("reward_max", float(reward_max)),
+            }
+            with open(effective_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+    return rewards
 
 
 def do_vlm_ocr_score(
@@ -1611,21 +2319,27 @@ def do_vlm_ocr_score(
     rewards = []
     for i, image in enumerate(images):
         image_prompt = prompts[i] if i < len(prompts) else ""
-        per_image_target_text = target_text if target_text is not None else image_prompt
+        generation_context = str(image_prompt)
+        per_image_target_text = (
+            str(target_text)
+            if target_text is not None and str(target_text).strip()
+            else _extract_target_string_to_match(generation_context)
+        )
         if bool(vlm_numeric_only_output):
             query_text = _vlm_ocr_numeric_query_text(
-                target_text=str(per_image_target_text),
+                target_string_to_match=str(per_image_target_text),
+                generation_context=generation_context,
             )
         else:
             query_text = _vlm_ocr_query_text(
-                target_text=str(per_image_target_text),
+                target_string_to_match=str(per_image_target_text),
                 reward_key=str(reward_key),
+                generation_context=generation_context,
             )
         if include_prompt_context and image_prompt:
             query_text = (
                 f"{query_text}\n"
-                f"Generation prompt context: {image_prompt}\n"
-                "Judge text rendered in the image against TARGET_TEXT."
+                "Judge text rendered in the image against TARGET_STRING_TO_MATCH."
             )
         messages = [
             {
@@ -1650,8 +2364,12 @@ def do_vlm_ocr_score(
             images=[image],
             return_tensors="pt",
         )
-        if not using_device_map:
-            inputs = {k: v.to(target_device) for k, v in inputs.items()}
+        generation_device = _resolve_generation_device(
+            model=model,
+            target_device=target_device,
+            using_device_map=using_device_map,
+        )
+        inputs = _move_generation_inputs(inputs, generation_device)
 
         with torch.no_grad():
             generated = model.generate(
@@ -1707,11 +2425,327 @@ def do_vlm_ocr_score(
                 "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
                 "particle_idx": int(i),
                 "target_text": str(per_image_target_text),
+                "target_string_to_match": str(per_image_target_text),
+                "generation_context": generation_context,
                 "query_text": str(query_text),
                 "raw_answer": str(answer),
                 "parsed_json": parsed if isinstance(parsed, dict) else None,
                 "reward_key": str(reward_key),
                 "reward": float(reward),
+            }
+            with open(effective_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+    return rewards
+
+
+def do_vlm_ocr_score_v2(
+    *,
+    images,
+    prompts,
+    target_text=None,
+    include_prompt_context=True,
+    qwen_model_name="Qwen/Qwen3-VL-2B-Thinking",
+    qwen_hf_device=None,
+    qwen_hf_device_map=None,
+    qwen_hf_dtype=None,
+    qwen_hf_max_memory=None,
+    qwen_hf_offload_folder=None,
+    qwen_hf_low_cpu_mem_usage=True,
+    qwen_tp_plan=None,
+    qwen_attn_implementation=None,
+    qwen_trust_remote_code=True,
+    qwen_force_reload=False,
+    hf_revision=None,
+    qwen_query_max_tokens=220,
+    qwen_do_sample=False,
+    qwen_temperature=0.0,
+    qwen_top_p=1.0,
+    qwen_debug_print=False,
+    vlm_log_enabled=True,
+    vlm_log_path=None,
+    vlm_log_to_output=True,
+    warn_parse_failures=True,
+    debug_sampling_idx=None,
+    # Python-side aggregator weights
+    w_exact_match=0.35,
+    w_char_accuracy=0.25,
+    w_legibility=0.10,
+    w_completeness=0.10,
+    w_region_match=0.08,
+    w_alignment=0.06,
+    w_coverage=0.06,
+    w_visual_quality=0.15,
+    w_extra_text_penalty=0.25,
+    w_extra_objects_penalty=0.10,
+    reward_min=0.0,
+    reward_max=1.0,
+    **_unused_kwargs,
+):
+    """
+    OCR reward V2:
+    - requests structured OCR/layout/quality components from VLM
+    - computes spelling metrics in code from detected_text
+    - computes final reward in Python from configurable component weights
+    """
+    global REWARDS_DICT
+    if float(reward_min) > float(reward_max):
+        raise ValueError("VLMOCRScoreV2: reward_min must be <= reward_max.")
+
+    dtype = qwen_hf_dtype
+    if dtype is None:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    target_device = (
+        qwen_hf_device
+        if qwen_hf_device is not None
+        else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
+    device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    load_kw = {}
+    if hf_revision is not None:
+        load_kw["revision"] = hf_revision
+    cache_key = (
+        str(qwen_model_name),
+        str(hf_revision),
+        str(dtype),
+        str(target_device),
+        repr(device_map),
+        repr(qwen_hf_max_memory),
+        str(qwen_hf_offload_folder),
+        bool(qwen_hf_low_cpu_mem_usage),
+        str(qwen_tp_plan),
+        str(qwen_attn_implementation),
+        bool(qwen_trust_remote_code),
+    )
+    cached = REWARDS_DICT["VLMOCRScoreV2"]
+    needs_reload = bool(qwen_force_reload) or cached is None or cached.get("cache_key") != cache_key
+    if needs_reload:
+        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
+        model_load_kw = dict(load_kw)
+        model_load_kw["device_map"] = device_map
+        model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
+        model_load_kw["low_cpu_mem_usage"] = bool(qwen_hf_low_cpu_mem_usage)
+        if qwen_hf_max_memory is not None:
+            model_load_kw["max_memory"] = qwen_hf_max_memory
+        if qwen_hf_offload_folder is not None:
+            model_load_kw["offload_folder"] = qwen_hf_offload_folder
+        if qwen_tp_plan is not None:
+            model_load_kw["tp_plan"] = qwen_tp_plan
+        if qwen_attn_implementation is not None:
+            model_load_kw["attn_implementation"] = qwen_attn_implementation
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                torch_dtype=dtype,
+                **model_load_kw,
+            )
+        except TypeError:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                dtype=dtype,
+                **model_load_kw,
+            )
+        if device_map is None:
+            model = model.to(target_device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
+        REWARDS_DICT["VLMOCRScoreV2"] = {
+            "model_name": qwen_model_name,
+            "model": model,
+            "processor": processor,
+            "device": target_device,
+            "device_map": device_map,
+            "cache_key": cache_key,
+        }
+    cache_entry = REWARDS_DICT["VLMOCRScoreV2"]
+    model = cache_entry["model"]
+    processor = cache_entry["processor"]
+    target_device = cache_entry["device"]
+    using_device_map = cache_entry["device_map"] is not None
+
+    effective_log_path = vlm_log_path
+    if bool(vlm_log_enabled) and effective_log_path is None and vlm_log_to_output:
+        effective_log_path = os.path.join("output", "vlm_ocr_v2_intermediate_logs.jsonl")
+    if not bool(vlm_log_enabled):
+        effective_log_path = None
+
+    rewards = []
+    for i, image in enumerate(images):
+        image_prompt = prompts[i] if i < len(prompts) else ""
+        generation_context = str(image_prompt)
+        per_image_target_text = (
+            str(target_text)
+            if target_text is not None and str(target_text).strip()
+            else _extract_target_string_to_match(generation_context)
+        )
+        query_text = _vlm_ocr_v2_query_text(
+            target_string_to_match=str(per_image_target_text),
+            generation_context=generation_context,
+        )
+        if include_prompt_context and image_prompt:
+            query_text = (
+                f"{query_text}\n"
+                "Judge text rendered in the image against TARGET_STRING_TO_MATCH."
+            )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": query_text},
+                ],
+            }
+        ]
+        prompt_for_model = query_text
+        if hasattr(processor, "apply_chat_template"):
+            try:
+                prompt_for_model = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                prompt_for_model = query_text
+
+        inputs = processor(
+            text=[prompt_for_model],
+            images=[image],
+            return_tensors="pt",
+        )
+        generation_device = _resolve_generation_device(
+            model=model,
+            target_device=target_device,
+            using_device_map=using_device_map,
+        )
+        inputs = _move_generation_inputs(inputs, generation_device)
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=int(qwen_query_max_tokens),
+                do_sample=bool(qwen_do_sample),
+                temperature=float(qwen_temperature),
+                top_p=float(qwen_top_p),
+            )
+        answer = ""
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            generated_ids = generated[:, inputs["input_ids"].shape[-1] :]
+            answer = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+        if not answer:
+            answer = processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+
+        parsed = _extract_json_object(answer)
+        reward = 0.0
+        meta = {}
+        if isinstance(parsed, dict):
+            detected_text = str(parsed.get("detected_text", "") or "")
+            tgt_norm = _normalize_ocr_text(str(per_image_target_text))
+            det_norm = _normalize_ocr_text(detected_text)
+            exact_match = 1.0 if (tgt_norm and det_norm == tgt_norm) else 0.0
+            if tgt_norm:
+                dist = _levenshtein_distance(det_norm, tgt_norm)
+                char_accuracy = float(max(0.0, 1.0 - (dist / max(len(tgt_norm), 1))))
+            else:
+                char_accuracy = 0.0
+
+            legibility = _to_unit_interval_number(parsed.get("legibility_score"))
+            completeness = _to_unit_interval_number(parsed.get("completeness_score"))
+            extra_text_penalty = _to_unit_interval_number(parsed.get("extra_text_penalty"))
+            region_match = _to_unit_interval_number(parsed.get("region_match_score"))
+            alignment = _to_unit_interval_number(parsed.get("alignment_score"))
+            coverage = _to_unit_interval_number(parsed.get("coverage_score"))
+            visual_quality = _to_unit_interval_number(parsed.get("visual_quality_score"))
+            extra_objects_penalty = _to_unit_interval_number(parsed.get("extra_objects_penalty"))
+
+            legibility = 0.0 if legibility is None else float(legibility)
+            completeness = 0.0 if completeness is None else float(completeness)
+            extra_text_penalty = 0.0 if extra_text_penalty is None else float(extra_text_penalty)
+            region_match = 0.0 if region_match is None else float(region_match)
+            alignment = 0.0 if alignment is None else float(alignment)
+            coverage = 0.0 if coverage is None else float(coverage)
+            visual_quality = 0.0 if visual_quality is None else float(visual_quality)
+            extra_objects_penalty = 0.0 if extra_objects_penalty is None else float(extra_objects_penalty)
+
+            reward_raw = (
+                float(w_exact_match) * exact_match
+                + float(w_char_accuracy) * char_accuracy
+                + float(w_legibility) * legibility
+                + float(w_completeness) * completeness
+                + float(w_region_match) * region_match
+                + float(w_alignment) * alignment
+                + float(w_coverage) * coverage
+                + float(w_visual_quality) * visual_quality
+                - float(w_extra_text_penalty) * extra_text_penalty
+                - float(w_extra_objects_penalty) * extra_objects_penalty
+            )
+            reward = float(
+                np.clip(reward_raw, float(reward_min), float(reward_max))
+            )
+
+            meta = {
+                "detected_text": detected_text,
+                "target_text_normalized": tgt_norm,
+                "detected_text_normalized": det_norm,
+                "exact_match_score": exact_match,
+                "character_accuracy": char_accuracy,
+                "legibility_score": legibility,
+                "completeness_score": completeness,
+                "extra_text_penalty": extra_text_penalty,
+                "region_match_score": region_match,
+                "alignment_score": alignment,
+                "coverage_score": coverage,
+                "visual_quality_score": visual_quality,
+                "extra_objects_penalty": extra_objects_penalty,
+                "reward_raw": reward_raw,
+                "reward": reward,
+                "weights": {
+                    "w_exact_match": float(w_exact_match),
+                    "w_char_accuracy": float(w_char_accuracy),
+                    "w_legibility": float(w_legibility),
+                    "w_completeness": float(w_completeness),
+                    "w_region_match": float(w_region_match),
+                    "w_alignment": float(w_alignment),
+                    "w_coverage": float(w_coverage),
+                    "w_visual_quality": float(w_visual_quality),
+                    "w_extra_text_penalty": float(w_extra_text_penalty),
+                    "w_extra_objects_penalty": float(w_extra_objects_penalty),
+                },
+                "reward_min": float(reward_min),
+                "reward_max": float(reward_max),
+            }
+        elif warn_parse_failures:
+            warnings.warn(
+                f"VLMOCRScoreV2: could not parse JSON from answer={answer!r}; using 0.0 reward.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if qwen_debug_print:
+            print(
+                "[VLMOCRScoreV2] "
+                f"idx={i} target_text={per_image_target_text!r} reward={reward:.5f} "
+                f"detected={meta.get('detected_text', '')!r} raw_answer={answer[:220]!r}"
+            )
+        rewards.append(float(reward))
+
+        if effective_log_path:
+            log_parent = os.path.dirname(effective_log_path)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+            rec = {
+                "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
+                "particle_idx": int(i),
+                "target_text": str(per_image_target_text),
+                "target_string_to_match": str(per_image_target_text),
+                "generation_context": generation_context,
+                "query_text": str(query_text),
+                "raw_answer": str(answer),
+                "parsed_json": parsed if isinstance(parsed, dict) else None,
+                "reward": float(reward),
+                "components": meta if isinstance(meta, dict) else None,
             }
             with open(effective_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
@@ -1891,8 +2925,12 @@ def do_qwen3_vl_style_reward(
             images=[image],
             return_tensors="pt",
         )
-        if not using_device_map:
-            inputs = {k: v.to(target_device) for k, v in inputs.items()}
+        generation_device = _resolve_generation_device(
+            model=model,
+            target_device=target_device,
+            using_device_map=using_device_map,
+        )
+        inputs = _move_generation_inputs(inputs, generation_device)
 
         with torch.no_grad():
             generated = model.generate(
@@ -1946,8 +2984,7 @@ def do_qwen3_vl_style_reward(
                 images=[image],
                 return_tensors="pt",
             )
-            if not using_device_map:
-                strict_inputs = {k: v.to(target_device) for k, v in strict_inputs.items()}
+            strict_inputs = _move_generation_inputs(strict_inputs, generation_device)
             with torch.no_grad():
                 strict_generated = model.generate(
                     **strict_inputs,

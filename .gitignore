@@ -11,6 +11,14 @@ discrete_diffusion/outputs/
 discrete_diffusion/src/
 text_to_image/fkd_diffusers/train_samples_sdv15/
 discrete_diffusion/mdlm
+src/diffusers/
+
+# Generated outputs and archives
+/output/
+text_to_image/output/
+/checkpoint/
+/checkpoints/
+*.zip
 
 # Distribution / packaging
 .Python

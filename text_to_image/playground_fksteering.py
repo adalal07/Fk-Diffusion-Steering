@@ -208,6 +208,42 @@ def make_qwen_reward_config(style_target: str) -> Dict:
         "query_text": query_text,
     }
 
+def make_vlm_reward_config(output_dir: str) -> Dict:
+    return {
+        "reward_key": "reward",
+
+        # ----- VLM logging -----
+        # Full VLM raw/parsed outputs are dumped here (jsonl, one record per image call).
+        "vlm_log_to_output": True,
+        "vlm_log_path": os.path.join(output_dir, "vlm_ocr_intermediate_logs.jsonl"),
+        # "vlm_log_enabled": False,         # turn off json saving
+        # "vlm_numeric_only_output": True,
+
+        # ----- Qwen3-VL model/runtime -----
+        "qwen_model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "qwen_hf_device_map": "auto",     # set to "auto" for sharded loading if needed
+        "qwen_hf_dtype": None,    
+        "qwen_hf_offload_folder": "output/hf_offload",
+        "qwen_hf_low_cpu_mem_usage": True,    
+        #"qwen_tp_plan": "auto",
+        "qwen_force_reload": False,
+
+        # ----- Generation controls (keep deterministic for stable rewards) -----
+        "qwen_query_max_tokens": 320,
+        "qwen_do_sample": False,
+        "qwen_temperature": 0.0,
+        "qwen_top_p": 1.0,
+
+        # ----- Prompting/debug -----
+        "include_prompt_context": True,
+        "qwen_debug_print": False,
+        "warn_parse_failures": True,
+
+        # VLMColorBinding: subtract penalty × extraneous_content_penalty from mean constraint score
+        "extra_items_penalty_weight": 1.0,
+        "reward_min": -1.0,
+        "reward_max": 1.0,
+    }
 
 def make_reward_config_for_reward(
     *, reward_name: str, style_target: str | None, output_dir: str
@@ -218,7 +254,15 @@ def make_reward_config_for_reward(
         cfg["qwen_log_path"] = os.path.join(output_dir, "qwen_intermediate_logs.jsonl")
         return cfg
     if reward_name == "VLMOCRScore":
-        return {"vlm_log_path": os.path.join(output_dir, "vlm_ocr_intermediate_logs.jsonl")}
+        return make_vlm_reward_config(output_dir)
+    if reward_name == "VLMOCRScoreV2":
+        cfg = make_vlm_reward_config(output_dir)
+        cfg["vlm_log_path"] = os.path.join(output_dir, "vlm_ocr_v2_intermediate_logs.jsonl")
+        return cfg
+    if reward_name == "VLMColorBinding":
+        cfg = make_vlm_reward_config(output_dir)
+        cfg["vlm_log_path"] = os.path.join(output_dir, "vlm_color_binding_logs.jsonl")
+        return cfg
     return {}
 
 
@@ -423,7 +467,8 @@ def main() -> None:
                         plt.close(fig)
 
                     trace_path = None
-                    if fkd_args.get("reward_history"):
+                    rh = fkd_args.get("reward_history")
+                    if rh is not None and len(rh) > 0:
                         trace = deepcopy(fkd_args["reward_history"])
                         trace_path = os.path.join(
                             prompt_plot_dir,
