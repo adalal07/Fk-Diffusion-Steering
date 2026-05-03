@@ -107,7 +107,11 @@ REWARDS_DICT = {
     "VLMOCRScore": None,
     "VLMOCRScoreV2": None,
     "VLMColorBinding": None,
+    "Qwen3VLSpatial": None,
 }
+
+# Printed once per process the first time Qwen3VLSpatial scores images (SMC can look "stuck").
+_QWEN3VL_SPATIAL_SLOW_HINT_EMITTED = False
 
 
 # Returns the reward function based on the guidance_reward_fn name
@@ -122,8 +126,6 @@ def get_reward_function(
     # Backward-compatible alias: reward_kwargs -> reward_config
     if reward_config is None:
         reward_config = reward_kwargs if reward_kwargs is not None else {}
-    if reward_name not in ("LLMGrader",):
-        print("`metric_to_chase` will be ignored as it only applies to 'LLMGrader' as the `reward_name`")
     if reward_name == "ImageReward":
         return do_image_reward(images=images, prompts=prompts)
     
@@ -190,6 +192,18 @@ def get_reward_function(
         return do_vlm_color_binding_score(
             images=images,
             prompts=prompts,
+            **cfg,
+        )
+
+    elif reward_name == "Qwen3VLSpatial":
+        cfg = dict(reward_config or {})
+        debug_overlay_dir = cfg.pop("debug_overlay_dir", None)
+        debug_sampling_idx = cfg.pop("debug_sampling_idx", None)
+        return do_qwen3_vl_spatial_awareness_reward(
+            images=images,
+            prompts=prompts,
+            debug_overlay_dir=debug_overlay_dir,
+            debug_sampling_idx=debug_sampling_idx,
             **cfg,
         )
 
@@ -2194,6 +2208,453 @@ def do_vlm_color_binding_score(
             }
             with open(effective_log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+    return rewards
+
+
+VLM_SPATIAL_AWARENESS_SYSTEM_PROMPT = """You are an expert vision-language judge for TEXT-TO-IMAGE spatial composition.
+You will see ONE generated image (possibly noisy or incomplete—intermediate denoising steps are allowed) and ONE natural-language IMAGE_GENERATION_PROMPT.
+
+Goal: provide a DENSE reward signal that separates (a) whether the right entities exist and are countable,
+(b) whether the requested spatial RELATIONS hold in a logically consistent way, and (c) how geometrically precise the layout is.
+
+Scoring rubric (each sub-score must be a real number in [0, 1]):
+1) existence_score — Are the SUBJECT and OBJECT entities (and any additional named objects) clearly rendered and recognizable?
+   Penalize missing objects, merged blobs that cannot be identified, duplicates when a single instance was requested (unless the prompt asks for multiples),
+   and severe identity swaps. Reward partial visibility only if identity is still clear.
+
+2) relation_score — Given what is visible, evaluate EVERY spatial relationship the prompt requires—not only one “primary” relation.
+   Mentally list each distinct constraint (e.g. left/right, in front/behind, above/below/underneath, inside/outside, between, next to, leaning against;
+   and compound chains such as “to the left of X and behind Y”, or several pairwise relations across multiple objects).
+   All stated relations matter equally unless the wording clearly ranks one as optional or secondary.
+   Score reflects how completely the FULL SET is satisfied: penalize missing or reversed relations even if another clause looks correct; give partial credit when some but not all constraints hold.
+   Ignore artistic style; judge layout semantics only.
+
+3) geometric_precision_score — How accurately are objects positioned relative to one another and to plausible scene physics (support, occlusion, scale, contact)?
+   High scores require consistent depth ordering, plausible contact/support, and roughly correct relative placement.
+   Lower scores for floating objects, contradictory depth, wrong stacking order, or relations right in spirit but sloppy in geometry.
+
+Important:
+- Base all judgments ONLY on visible pixels and the given IMAGE_GENERATION_PROMPT (no outside knowledge).
+- If the prompt requests multiple objects or counts, reflect wrong counts or missing entities primarily in existence_score.
+- relation_score must reflect satisfaction of ALL spatial obligations in the prompt together; do not optimize for one relation while ignoring others.
+- Output MUST be a single JSON object with exactly these keys and numeric values in [0,1] for the three scores:
+  {"existence_score": ..., "relation_score": ..., "geometric_precision_score": ..., "notes": "short justification"}
+- No markdown fences, no keys other than the four above, no trailing commentary outside JSON.
+"""
+
+
+def _vlm_spatial_user_instruction(image_generation_prompt: str) -> str:
+    p = (image_generation_prompt or "").strip()
+    return (
+        "IMAGE_GENERATION_PROMPT:\n"
+        f'"""{p}"""\n\n'
+        "Evaluate the attached image against this prompt using your system instructions.\n"
+        "Return ONLY one JSON object with keys existence_score, relation_score, geometric_precision_score, notes.\n"
+        "relation_score must reflect every spatial relation required by the prompt, not only one.\n"
+        "All *_score fields must be numbers in [0,1]."
+    )
+
+
+def _vlm_spatial_pick_subscore(d: dict, key_variants: tuple[str, ...]) -> float | None:
+    for k in key_variants:
+        if k in d:
+            v = _to_unit_interval_number(d.get(k))
+            if v is not None:
+                return float(v)
+    return None
+
+
+def _vlm_spatial_aggregate_reward(
+    parsed,
+    *,
+    weight_existence: float,
+    weight_relation: float,
+    weight_geometric: float,
+    reward_min: float,
+    reward_max: float,
+    warn_parse_failures: bool,
+    answer: str,
+) -> tuple[float, dict]:
+    """
+    Combine unit-interval sub-scores with nonnegative weights in [0, 1].
+    Final reward is clipped to [reward_min, reward_max] (defaults align with other VLM rewards).
+    """
+    for name, w in (
+        ("weight_existence", weight_existence),
+        ("weight_relation", weight_relation),
+        ("weight_geometric", weight_geometric),
+    ):
+        try:
+            wf = float(w)
+        except (TypeError, ValueError):
+            raise ValueError(f"Qwen3VLSpatial: {name} must be numeric.") from None
+        if not 0.0 <= wf <= 1.0:
+            raise ValueError(f"Qwen3VLSpatial: {name} must be in [0, 1], got {wf}.")
+
+    if not isinstance(parsed, dict):
+        if warn_parse_failures:
+            warnings.warn(
+                f"Qwen3VLSpatial: expected JSON object; answer={answer[:400]!r}",
+                UserWarning,
+                stacklevel=2,
+            )
+        return float(np.clip(0.0, reward_min, reward_max)), {
+            "existence": None,
+            "relation": None,
+            "geometric_precision": None,
+            "raw_weighted_sum": 0.0,
+            "weights": {
+                "existence": float(weight_existence),
+                "relation": float(weight_relation),
+                "geometric": float(weight_geometric),
+            },
+        }
+
+    e = _vlm_spatial_pick_subscore(
+        parsed,
+        ("existence_score", "Existence_Score", "existence"),
+    )
+    r = _vlm_spatial_pick_subscore(
+        parsed,
+        ("relation_score", "Relation_Score", "relation"),
+    )
+    g = _vlm_spatial_pick_subscore(
+        parsed,
+        (
+            "geometric_precision_score",
+            "Geometric_Precision_Score",
+            "geometric_precision",
+            "geometry_score",
+        ),
+    )
+
+    missing = []
+    if e is None:
+        missing.append("existence_score")
+        e = 0.0
+    if r is None:
+        missing.append("relation_score")
+        r = 0.0
+    if g is None:
+        missing.append("geometric_precision_score")
+        g = 0.0
+
+    if missing and warn_parse_failures:
+        warnings.warn(
+            "Qwen3VLSpatial: missing or invalid sub-score key(s) "
+            f"{missing}; substituted 0.0 for those. answer={answer[:320]!r}",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    we = float(weight_existence)
+    wr = float(weight_relation)
+    wg = float(weight_geometric)
+    raw = we * float(e) + wr * float(r) + wg * float(g)
+    reward = float(np.clip(raw, float(reward_min), float(reward_max)))
+    meta = {
+        "existence": float(e),
+        "relation": float(r),
+        "geometric_precision": float(g),
+        "raw_weighted_sum": float(raw),
+        "weights": {"existence": we, "relation": wr, "geometric": wg},
+        "reward_min": float(reward_min),
+        "reward_max": float(reward_max),
+    }
+    return reward, meta
+
+
+def do_qwen3_vl_spatial_awareness_reward(
+    *,
+    images,
+    prompts,
+    system_prompt=None,
+    weight_existence=0.3,
+    weight_relation=0.5,
+    weight_geometric=0.2,
+    qwen_model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
+    qwen_hf_device=None,
+    qwen_hf_device_map=None,
+    qwen_hf_dtype=None,
+    qwen_hf_max_memory=None,
+    qwen_hf_offload_folder=None,
+    qwen_hf_low_cpu_mem_usage=True,
+    qwen_tp_plan=None,
+    qwen_attn_implementation=None,
+    qwen_trust_remote_code=True,
+    qwen_force_reload=False,
+    hf_revision=None,
+    qwen_query_max_tokens=768,
+    qwen_do_sample=False,
+    qwen_temperature=0.0,
+    qwen_top_p=1.0,
+    qwen_debug_print=False,
+    vlm_log_enabled=True,
+    vlm_log_path=None,
+    vlm_log_to_output=True,
+    warn_parse_failures=True,
+    include_prompt_context=True,
+    reward_min=-1.0,
+    reward_max=1.0,
+    debug_overlay_dir=None,
+    debug_sampling_idx=None,
+    **_unused_kwargs,
+):
+    """
+    Qwen3-VL spatial-awareness reward: VLM returns JSON sub-scores; scalar reward is a weighted sum (weights in [0,1]) clipped to [reward_min, reward_max].
+    The rubric asks the model to rate ``relation_score`` from joint satisfaction of every spatial relation in the prompt, not a single primary relation.
+
+    Default model ``Qwen/Qwen3-VL-30B-A3B-Instruct`` matches the MoE VLM the project uses for other Qwen3-VL steering runs.
+
+    **FK steering:** The diffusion tqdm bar does not advance while this function runs. At each resampling timestep,
+    ``num_particles`` VLM forwards happen sequentially—often minutes per step for a 30B model—so the progress display can
+    stay frozen at e.g. ``10/100`` until the batch finishes (that is usually not a deadlock).
+    """
+    global REWARDS_DICT
+    global _QWEN3VL_SPATIAL_SLOW_HINT_EMITTED
+
+    sys_txt = system_prompt if system_prompt is not None else VLM_SPATIAL_AWARENESS_SYSTEM_PROMPT
+
+    dtype = qwen_hf_dtype
+    if dtype is None:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    target_device = (
+        qwen_hf_device
+        if qwen_hf_device is not None
+        else ("cuda:0" if torch.cuda.is_available() else "cpu")
+    )
+    device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    load_kw = {}
+    if hf_revision is not None:
+        load_kw["revision"] = hf_revision
+    cache_key = (
+        str(qwen_model_name),
+        str(hf_revision),
+        str(dtype),
+        str(target_device),
+        repr(device_map),
+        repr(qwen_hf_max_memory),
+        str(qwen_hf_offload_folder),
+        bool(qwen_hf_low_cpu_mem_usage),
+        str(qwen_tp_plan),
+        str(qwen_attn_implementation),
+        bool(qwen_trust_remote_code),
+    )
+    cached = REWARDS_DICT["Qwen3VLSpatial"]
+    needs_reload = bool(qwen_force_reload) or cached is None or cached.get("cache_key") != cache_key
+    if needs_reload:
+        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
+        model_load_kw = dict(load_kw)
+        model_load_kw["device_map"] = device_map
+        model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
+        model_load_kw["low_cpu_mem_usage"] = bool(qwen_hf_low_cpu_mem_usage)
+        if qwen_hf_max_memory is not None:
+            model_load_kw["max_memory"] = qwen_hf_max_memory
+        if qwen_hf_offload_folder is not None:
+            model_load_kw["offload_folder"] = qwen_hf_offload_folder
+        if qwen_tp_plan is not None:
+            model_load_kw["tp_plan"] = qwen_tp_plan
+        if qwen_attn_implementation is not None:
+            model_load_kw["attn_implementation"] = qwen_attn_implementation
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                torch_dtype=dtype,
+                **model_load_kw,
+            )
+        except TypeError:
+            model = AutoModelForImageTextToText.from_pretrained(
+                qwen_model_name,
+                dtype=dtype,
+                **model_load_kw,
+            )
+        if device_map is None:
+            model = model.to(target_device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
+        REWARDS_DICT["Qwen3VLSpatial"] = {
+            "model_name": qwen_model_name,
+            "model": model,
+            "processor": processor,
+            "device": target_device,
+            "device_map": device_map,
+            "cache_key": cache_key,
+        }
+    cache_entry = REWARDS_DICT["Qwen3VLSpatial"]
+    model = cache_entry["model"]
+    processor = cache_entry["processor"]
+    target_device = cache_entry["device"]
+    using_device_map = cache_entry["device_map"] is not None
+
+    effective_log_path = vlm_log_path
+    if bool(vlm_log_enabled) and effective_log_path is None and vlm_log_to_output:
+        effective_log_path = os.path.join("output", "vlm_spatial_awareness_logs.jsonl")
+    if not bool(vlm_log_enabled):
+        effective_log_path = None
+
+    if (
+        not _QWEN3VL_SPATIAL_SLOW_HINT_EMITTED
+        and not os.environ.get("FKD_QUIET_SPATIAL_REWARD_HINT")
+    ):
+        _QWEN3VL_SPATIAL_SLOW_HINT_EMITTED = True
+        n_img = len(images) if images is not None else 0
+        print(
+            "[Qwen3VLSpatial] Scoring each decoded particle with the VLM (sequential). "
+            f"This batch: {n_img} forward pass(es). The diffusion progress bar will not move until "
+            "the batch finishes — first pause is often long with a 30B VLM + many particles.",
+            flush=True,
+        )
+
+    rewards = []
+    for i, image in enumerate(images):
+        image_prompt = prompts[i] if i < len(prompts) else ""
+        user_txt = _vlm_spatial_user_instruction(image_prompt)
+        if include_prompt_context and str(image_prompt).strip():
+            user_txt = (
+                f"{user_txt}\n\n"
+                "Use the prompt text as the sole specification of which objects and spatial relations must hold."
+            )
+
+        messages = [
+            {"role": "system", "content": sys_txt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": user_txt},
+                ],
+            },
+        ]
+        prompt_for_model = user_txt
+        prompt_for_model = f"{sys_txt}\n\n{user_txt}"
+        if hasattr(processor, "apply_chat_template"):
+            try:
+                prompt_for_model = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            except Exception:
+                merged_user = f"{sys_txt}\n\n{user_txt}"
+                alt_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": merged_user},
+                        ],
+                    }
+                ]
+                try:
+                    prompt_for_model = processor.apply_chat_template(
+                        alt_messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    prompt_for_model = merged_user
+
+        inputs = processor(
+            text=[prompt_for_model],
+            images=[image],
+            return_tensors="pt",
+        )
+        generation_device = _resolve_generation_device(
+            model=model,
+            target_device=target_device,
+            using_device_map=using_device_map,
+        )
+        inputs = _move_generation_inputs(inputs, generation_device)
+
+        with torch.no_grad():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=int(qwen_query_max_tokens),
+                do_sample=bool(qwen_do_sample),
+                temperature=float(qwen_temperature),
+                top_p=float(qwen_top_p),
+            )
+        answer = ""
+        if "input_ids" in inputs and inputs["input_ids"] is not None:
+            generated_ids = generated[:, inputs["input_ids"].shape[-1] :]
+            answer = processor.batch_decode(
+                generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+        if not answer:
+            answer = processor.batch_decode(
+                generated, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )[0].strip()
+
+        parsed = _extract_json_object(answer)
+        if isinstance(parsed, dict):
+            reward, meta = _vlm_spatial_aggregate_reward(
+                parsed,
+                weight_existence=float(weight_existence),
+                weight_relation=float(weight_relation),
+                weight_geometric=float(weight_geometric),
+                reward_min=float(reward_min),
+                reward_max=float(reward_max),
+                warn_parse_failures=warn_parse_failures,
+                answer=answer,
+            )
+        else:
+            reward, meta = 0.0, {}
+            reward = float(np.clip(reward, float(reward_min), float(reward_max)))
+            if warn_parse_failures:
+                warnings.warn(
+                    f"Qwen3VLSpatial: could not parse JSON from answer={answer[:400]!r}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        rewards.append(float(reward))
+
+        if qwen_debug_print:
+            print(
+                "[Qwen3VLSpatial] "
+                f"idx={i} reward={reward:.5f} meta={meta} raw_answer={answer[:260]!r}"
+            )
+
+        if effective_log_path:
+            log_parent = os.path.dirname(effective_log_path)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+            rec = {
+                "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
+                "particle_idx": int(i),
+                "prompt": str(image_prompt),
+                "query_system_chars": len(sys_txt),
+                "query_user_excerpt": user_txt[:500],
+                "raw_answer": str(answer),
+                "parsed_json": parsed if isinstance(parsed, dict) else None,
+                "reward": float(reward),
+                "components": meta,
+            }
+            with open(effective_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+        if debug_overlay_dir is not None and debug_sampling_idx is not None:
+            rtag = f"{reward:+.5f}".replace("+", "p").replace("-", "m")
+            out_path = os.path.join(
+                debug_overlay_dir,
+                f"step_{int(debug_sampling_idx):04d}_particle_{i:02d}_r{rtag}.png",
+            )
+            ex = meta.get("existence") if isinstance(meta, dict) else None
+            ln = (
+                f"e={ex:.2f} r={meta.get('relation'):.2f} g={meta.get('geometric_precision'):.2f}"
+                if isinstance(meta, dict)
+                and meta.get("relation") is not None
+                and meta.get("geometric_precision") is not None
+                and ex is not None
+                else str(answer)[:120]
+            )
+            _save_moondream_debug_pil(
+                image,
+                out_path,
+                title_lines=[
+                    f"sampling_idx={debug_sampling_idx} particle={i}",
+                    f"reward={reward:.5f}",
+                    ln,
+                    (prompts[i] if i < len(prompts) else "")[:90],
+                ],
+            )
 
     return rewards
 

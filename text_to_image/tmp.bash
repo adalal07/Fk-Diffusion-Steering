@@ -43,3 +43,16 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 python text_to_image/playground_fksteering.py \
   python3 text_to_image/analyze_vlm_ocr_failures.py \
   --log-path output/20260430-004234/vlm_ocr_intermediate_logs.jsonl \
   --output-dir output/20260430-004234/analysis_vlm_ocr
+
+  CUDA_VISIBLE_DEVICES=5,6 python playground_fksteering.py \
+  --prompt-path prompt_files/spatial_awareness_relations.json \
+  --repeat-count 5 \
+  --guidance-reward-fns Qwen3VLSpatial \
+  --lmbda 4.0 \
+  --num-particles 8 \
+  --resample-frequency 10 \
+  --time-steps 100 \
+  --potential-type max \
+  --resampling-t-start 10 \
+  --resampling-t-end 60 \
+  --include-terminal-resample

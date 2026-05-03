@@ -1,0 +1,31 @@
+[
+  {"difficulty": "easy", "prompt": "A red ball to the left of a blue cube on a white surface."},
+  {"difficulty": "easy", "prompt": "A cat sitting to the right of a small wooden chair."},
+  {"difficulty": "easy", "prompt": "A desk lamp placed directly above a closed book."},
+  {"difficulty": "easy", "prompt": "A coffee mug underneath a floating shelf, casting a soft shadow."},
+  {"difficulty": "easy", "prompt": "A tennis racket leaning to the left of a sports bag."},
+  {"difficulty": "easy", "prompt": "Two apples on a table: the green apple is to the right of the red apple."},
+
+  {"difficulty": "medium", "prompt": "A bicycle leaning against the left side of a tall brick wall."},
+  {"difficulty": "medium", "prompt": "A large oak tree in front of a suburban house with a gabled roof."},
+  {"difficulty": "medium", "prompt": "A silver car parked just behind a wooden picket fence."},
+  {"difficulty": "medium", "prompt": "A ceramic mug on the table to the right of an open laptop."},
+  {"difficulty": "medium", "prompt": "A basketball resting on the ground next to the right side of a hoop pole."},
+  {"difficulty": "medium", "prompt": "A child standing between two adults on a sidewalk."},
+  {"difficulty": "medium", "prompt": "A boat on a lake with mountains visible behind the horizon line."},
+
+  {"difficulty": "hard", "prompt": "A hiking backpack on the ground to the left and slightly behind a standing hiker."},
+  {"difficulty": "hard", "prompt": "A gray cat sitting underneath a wooden park bench, paws visible on grass."},
+  {"difficulty": "hard", "prompt": "A soccer ball lying outside of an empty wire trash can; the ball is not inside the rim."},
+  {"difficulty": "hard", "prompt": "An umbrella opened above a picnic blanket; the blanket is spread underneath the umbrella."},
+  {"difficulty": "hard", "prompt": "A vase on a wall shelf in front of and to the left of a framed painting."},
+  {"difficulty": "hard", "prompt": "A person stepping out of a doorway; their body is partly inside the building and partly outside."},
+  {"difficulty": "hard", "prompt": "A dog lying under a dining table while chairs are pushed in around the table."},
+
+  {"difficulty": "composite", "prompt": "A floor lamp to the left of a sofa, a side table behind the sofa, and a reading lamp on top of the side table."},
+  {"difficulty": "composite", "prompt": "A spoon inside a ceramic bowl, the bowl to the right of a dinner plate, and the plate in front of a wine glass."},
+  {"difficulty": "composite", "prompt": "A golden retriever to the left of a fire hydrant and a tabby cat behind the hydrant, all on a city sidewalk."},
+  {"difficulty": "composite", "prompt": "A notebook stacked on top of a textbook; the textbook is to the left of a pencil case; the pencil case is underneath the edge of a ruler."},
+  {"difficulty": "composite", "prompt": "A cyclist on the road to the right of a parked van; a pedestrian on the sidewalk behind the van; a streetlamp in front of both."},
+  {"difficulty": "composite", "prompt": "A potted plant on a windowsill behind a watering can; the watering can is to the left of the plant; sunlight comes through the window above them."}
+]

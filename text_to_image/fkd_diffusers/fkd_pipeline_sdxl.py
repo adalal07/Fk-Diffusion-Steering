@@ -361,6 +361,7 @@ class FKDStableDiffusionXL(
                 The arguments to be passed to the FKD class. If not defined, FKD will not be used.
                 If ``guidance_reward_fn`` is ``GroundingDINOSpatial``, you may set ``grounding_overlay_dir`` to a
                 directory; decoded ``x0`` previews at SMC steps are saved there with detector boxes overlaid.
+                Set ``verbose_fkd_args`` to ``True`` to print the full ``fkd_args`` dict once per call (default off).
 
             prompt_2 (`str` or `List[str]`, *optional*):
                 The prompt or prompts to be sent to the `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
@@ -706,7 +707,8 @@ class FKDStableDiffusionXL(
 
             return torch.tensor(rewards).to(x.device)
 
-        print('Args:', fkd_args)
+        if fkd_args is not None and fkd_args.get("verbose_fkd_args"):
+            print("Args:", fkd_args)
         fkd = None
         _use_fkd = fkd_args is not None and (
             bool(fkd_args.get("use_smc")) or bool(fkd_args.get("record_reward_trace"))

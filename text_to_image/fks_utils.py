@@ -22,6 +22,7 @@ from fkd_diffusers.rewards import (
     do_vlm_ocr_score,
     do_vlm_ocr_score_v2,
     do_vlm_color_binding_score,
+    do_qwen3_vl_spatial_awareness_reward,
 )
 
 
@@ -187,6 +188,17 @@ def do_eval(*, prompt, images, metrics_to_compute, reward_config=None):
         elif metric == "VLMColorBinding":
             results[metric] = {}
             results[metric]["result"] = do_vlm_color_binding_score(
+                images=images, prompts=prompt, **reward_config
+            )
+
+            mean, std, vmax, vmin = _agg_stats(results[metric]["result"])
+            results[metric]["mean"] = mean
+            results[metric]["std"] = std
+            results[metric]["max"] = vmax
+            results[metric]["min"] = vmin
+        elif metric == "Qwen3VLSpatial":
+            results[metric] = {}
+            results[metric]["result"] = do_qwen3_vl_spatial_awareness_reward(
                 images=images, prompts=prompt, **reward_config
             )
 

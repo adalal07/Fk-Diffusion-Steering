@@ -208,6 +208,32 @@ def make_qwen_reward_config(style_target: str) -> Dict:
         "query_text": query_text,
     }
 
+def make_qwen3vl_spatial_reward_config(output_dir: str) -> Dict:
+    """Minimal reward_config for Qwen3VLSpatial (no OCR/color-binding-only keys)."""
+    return {
+        "vlm_log_to_output": True,
+        "vlm_log_path": os.path.join(output_dir, "vlm_spatial_awareness_logs.jsonl"),
+        "qwen_model_name": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "qwen_hf_device_map": "auto",
+        "qwen_hf_dtype": None,
+        "qwen_hf_offload_folder": "output/hf_offload",
+        "qwen_hf_low_cpu_mem_usage": True,
+        "qwen_force_reload": False,
+        "qwen_query_max_tokens": 768,
+        "qwen_do_sample": False,
+        "qwen_temperature": 0.0,
+        "qwen_top_p": 1.0,
+        "include_prompt_context": True,
+        "qwen_debug_print": False,
+        "warn_parse_failures": True,
+        "weight_existence": 0.3,
+        "weight_relation": 0.5,
+        "weight_geometric": 0.2,
+        "reward_min": -1.0,
+        "reward_max": 1.0,
+    }
+
+
 def make_vlm_reward_config(output_dir: str) -> Dict:
     return {
         "reward_key": "reward",
@@ -263,6 +289,8 @@ def make_reward_config_for_reward(
         cfg = make_vlm_reward_config(output_dir)
         cfg["vlm_log_path"] = os.path.join(output_dir, "vlm_color_binding_logs.jsonl")
         return cfg
+    if reward_name == "Qwen3VLSpatial":
+        return make_qwen3vl_spatial_reward_config(output_dir)
     return {}
 
 
