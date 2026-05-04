@@ -838,6 +838,9 @@ class FKDStableDiffusionXL(
                     fkd_args["reward_config"]["debug_time_steps"] = fkd_args.get("time_steps")
                     # Always expose current diffusion step to reward functions/loggers.
                     fkd_args["reward_config"]["debug_sampling_idx"] = i
+                    fkd_args["reward_config"]["debug_intermediate_images_dir"] = (
+                        fkd_args.get("intermediate_images_dir")
+                    )
                     if fkd_args.get("grounding_overlay_dir"):
                         fkd_args["reward_config"]["debug_overlay_dir"] = fkd_args[
                             "grounding_overlay_dir"
@@ -857,6 +860,13 @@ class FKDStableDiffusionXL(
                     latents, current_pop_images = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
                     )
+                    if fkd.resampling_step_active(i) and not os.environ.get(
+                        "FKD_QUIET_FKD_STEP_LOG"
+                    ):
+                        fk_steering_log(
+                            f"[FKD] Denoising index i={i}: reward evaluation finished; "
+                            f"continuing denoising (next index {i + 1} of {len(timesteps)})."
+                        )
 
                     if (
                         current_pop_images is not None

@@ -1414,15 +1414,168 @@ def _import_moondream_sdk():
 
 
 def _import_qwen3_vl_hf():
+    """Legacy name: returns ``AutoModelForImageTextToText`` + ``AutoProcessor``."""
     try:
         from transformers import AutoModelForImageTextToText, AutoProcessor
     except ImportError as e:
         raise ImportError(
-            "Qwen3-VL rewards require a recent `transformers` with "
-            "`AutoModelForImageTextToText` (vision-language generation). "
+            "VLM OCR / Qwen3-VL rewards need a recent `transformers` with "
+            "`AutoModelForImageTextToText` (and `AutoProcessor`). "
             "Install: pip install -U 'transformers>=4.51' accelerate"
         ) from e
     return AutoModelForImageTextToText, AutoProcessor
+
+
+def _vlm_ocr_v2_resolve_model_id(*, vlm_model_name, qwen_model_name, default: str) -> str:
+    for candidate in (vlm_model_name, qwen_model_name):
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return str(default)
+
+
+def _torch_version_tuple() -> tuple:
+    """
+    Parse ``torch.__version__`` into a numeric prefix, e.g. ``2.4.0+cu124`` -> ``(2, 4, 0)``.
+    """
+    try:
+        s = str(torch.__version__).split("+")[0].strip()
+        parts = []
+        for seg in s.split(".")[:3]:
+            m = re.match(r"^(\d+)", seg)
+            if m:
+                parts.append(int(m.group(1)))
+            else:
+                break
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _vlm_preflight_gemma4_torch(model_id: str) -> None:
+    """
+    Gemma 4 in recent ``transformers`` uses sliding-window attention helpers that require
+    ``torch>=2.6`` (``masking_utils.create_sliding_window_causal_mask``), else the first
+    ``generate`` call raises a cryptic ValueError.
+    """
+    if not re.search(r"gemma[-_/]?4", str(model_id).lower()):
+        return
+    if _torch_version_tuple() >= (2, 6, 0):
+        return
+    raise RuntimeError(
+        "VLMOCRScoreV2: Gemma 4 requires PyTorch >= 2.6 (Hugging Face slides attention masks that call "
+        f"``or_mask_function`` / ``and_mask_function`` in torch 2.6+). Your torch is {torch.__version__}. "
+        "Upgrade torch and matching torchvision, e.g. `pip install -U 'torch>=2.6' torchvision` with the "
+        "PyTorch index URL for your CUDA version (see https://pytorch.org/get-started/locally/)."
+    )
+
+
+def _vlm_ocr_v2_from_pretrained(model_cls, model_id: str, dtype, model_load_kw: dict):
+    try:
+        return model_cls.from_pretrained(
+            model_id, torch_dtype=dtype, **model_load_kw
+        )
+    except TypeError:
+        return model_cls.from_pretrained(model_id, dtype=dtype, **model_load_kw)
+
+
+def _load_vlm_ocr_v2_model_and_processor(
+    model_id: str,
+    dtype,
+    *,
+    load_kw: dict,
+    model_load_kw: dict,
+    vlm_hf_model_class: str = "auto",
+):
+    """
+    Load a vision–language model for ``VLMOCRScoreV2``.
+
+    ``vlm_hf_model_class``:
+    - ``auto`` — try ``AutoModelForImageTextToText`` (Qwen3-VL, Gemma 4, …), then
+      ``AutoModelForVision2Seq`` as a fallback for older stacks.
+    - ``image_text_to_text`` / ``itt`` — only ``AutoModelForImageTextToText``
+    - ``vision2seq`` / ``v2s`` — only ``AutoModelForVision2Seq``
+    """
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(model_id, **load_kw)
+    choice = (vlm_hf_model_class or "auto").strip().lower().replace("-", "_")
+    errs = []
+
+    def _try_img_txt():
+        from transformers import AutoModelForImageTextToText
+
+        return _vlm_ocr_v2_from_pretrained(
+            AutoModelForImageTextToText, model_id, dtype, model_load_kw
+        )
+
+    def _try_vis2seq():
+        from transformers import AutoModelForVision2Seq
+
+        return _vlm_ocr_v2_from_pretrained(
+            AutoModelForVision2Seq, model_id, dtype, model_load_kw
+        )
+
+    model = None
+    if choice in ("auto", "", "image_text_to_text", "itt"):
+        try:
+            model = _try_img_txt()
+        except Exception as e:
+            errs.append(("AutoModelForImageTextToText", e))
+            if choice in ("image_text_to_text", "itt"):
+                raise RuntimeError(
+                    f"VLMOCRScoreV2: AutoModelForImageTextToText failed for {model_id!r}"
+                ) from e
+
+    if model is None and choice in ("auto", "", "vision2seq", "v2s"):
+        try:
+            model = _try_vis2seq()
+        except Exception as e:
+            errs.append(("AutoModelForVision2Seq", e))
+            if choice in ("vision2seq", "v2s"):
+                raise RuntimeError(
+                    f"VLMOCRScoreV2: AutoModelForVision2Seq failed for {model_id!r}"
+                ) from e
+
+    if model is None:
+        msg = (
+            f"VLMOCRScoreV2: could not load {model_id!r} "
+            f"(vlm_hf_model_class={vlm_hf_model_class!r}). Errors: "
+            + "; ".join(f"{n}: {exc!r}" for n, exc in errs)
+        )
+        raise RuntimeError(msg)
+
+    return model, processor
+
+
+def _coerce_device_map_and_max_memory_for_tp(
+    device_map, max_memory, tp_plan, label: str
+):
+    """
+    Transformers forbids combining ``device_map`` with ``tp_plan`` in ``from_pretrained``.
+    ``max_memory`` is only meaningful for accelerate ``device_map`` loads, so drop it too
+    when tensor-parallel loading is requested.
+    """
+    if tp_plan is None or not str(tp_plan).strip():
+        return device_map, max_memory
+    new_dm, new_mm = device_map, max_memory
+    if device_map is not None:
+        warnings.warn(
+            f"{label}: ``qwen_tp_plan`` is set; ignoring ``qwen_hf_device_map`` "
+            "(HF tensor parallelism cannot be combined with ``device_map``).",
+            UserWarning,
+            stacklevel=3,
+        )
+        new_dm = None
+    if max_memory is not None:
+        warnings.warn(
+            f"{label}: ``qwen_tp_plan`` is set; ignoring ``qwen_hf_max_memory`` for this load.",
+            UserWarning,
+            stacklevel=3,
+        )
+        new_mm = None
+    return new_dm, new_mm
 
 
 def _resolve_generation_device(model, target_device, using_device_map):
@@ -1596,10 +1749,15 @@ def _extract_first_float(text: str):
 
 
 def _vlm_ocr_v2_query_text(target_string_to_match: str, generation_context: str = ""):
+    # Strong anti-hallucination wording: VLMs often copy TARGET / prompt into detected_text
+    # when those strings are repeated in the instruction (instruction bias / sycophancy).
     return (
-        "You are a strict OCR + layout + visual quality evaluator for generated images.\n"
-        f'GENERATION_CONTEXT: "{generation_context}"\n'
-        f'TARGET_STRING_TO_MATCH: "{target_string_to_match}"\n'
+        "You are a strict OCR + layout + visual quality evaluator for AI-generated images.\n"
+        "IMPORTANT: Transcribe ONLY what is actually painted/rendered in the image pixels.\n"
+        "The scene prompt below describes what the generator was ASKED for — it is NOT ground truth.\n"
+        f'SCENE_GENERATION_PROMPT (aspirational; text here may be MISSING or garbled in the image): "{generation_context}"\n'
+        f'REFERENCE_STRING_FOR_METRICS (use only AFTER setting detected_text from the image; '
+        f'do NOT copy this into detected_text unless those exact glyphs are clearly visible): "{target_string_to_match}"\n'
         "Return ONLY one JSON object with exactly these keys:\n"
         "{\n"
         '  "detected_text": string,\n'
@@ -1615,7 +1773,12 @@ def _vlm_ocr_v2_query_text(target_string_to_match: str, generation_context: str 
         "}\n"
         "Rules:\n"
         "- Use numbers in [0,1] for all *_score / *_penalty fields.\n"
-        "- detected_text should be your best OCR read.\n"
+        "- detected_text: your literal OCR of visible letters/digits/symbols. Use \"\" if there is no readable text, "
+        "only blobs/smears, or nothing legible.\n"
+        "- Never set detected_text to REFERENCE_STRING_FOR_METRICS just to match the request — that is hallucination.\n"
+        "- legibility_score: readability of whatever text is actually visible (use ~0 if detected_text is \"\").\n"
+        "- completeness_score: how much of REFERENCE_STRING_FOR_METRICS is actually present in detected_text "
+        "(0 if detected_text is \"\" or clearly wrong).\n"
         "- No markdown, no extra prose outside the JSON object.\n"
     )
 
@@ -1984,6 +2147,9 @@ def do_vlm_color_binding_score(
         else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
     device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    device_map, qwen_hf_max_memory = _coerce_device_map_and_max_memory_for_tp(
+        device_map, qwen_hf_max_memory, qwen_tp_plan, "VLMColorBinding"
+    )
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
@@ -2439,6 +2605,9 @@ def do_qwen3_vl_spatial_awareness_reward(
         device_map = "balanced"
     else:
         device_map = None
+    device_map, qwen_hf_max_memory = _coerce_device_map_and_max_memory_for_tp(
+        device_map, qwen_hf_max_memory, qwen_tp_plan, "Qwen3VLSpatial"
+    )
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
@@ -2728,6 +2897,9 @@ def do_vlm_ocr_score(
         else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
     device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    device_map, qwen_hf_max_memory = _coerce_device_map_and_max_memory_for_tp(
+        device_map, qwen_hf_max_memory, qwen_tp_plan, "VLMOCRScore"
+    )
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
@@ -2926,6 +3098,8 @@ def do_vlm_ocr_score_v2(
     target_text=None,
     include_prompt_context=True,
     qwen_model_name="Qwen/Qwen3-VL-2B-Instruct",
+    vlm_model_name=None,
+    vlm_hf_model_class="auto",
     qwen_hf_device=None,
     qwen_hf_device_map=None,
     qwen_hf_dtype=None,
@@ -2947,6 +3121,7 @@ def do_vlm_ocr_score_v2(
     vlm_log_to_output=True,
     warn_parse_failures=True,
     debug_sampling_idx=None,
+    debug_intermediate_images_dir=None,
     # Python-side aggregator weights
     w_exact_match=0.35,
     w_char_accuracy=0.25,
@@ -2967,10 +3142,23 @@ def do_vlm_ocr_score_v2(
     - requests structured OCR/layout/quality components from VLM
     - computes spelling metrics in code from detected_text
     - computes final reward in Python from configurable component weights
+
+    Model selection:
+    - ``vlm_model_name`` — preferred HF model id for this reward (e.g. ``google/gemma-4-26B-A4B-it``).
+    - ``qwen_model_name`` — fallback id when ``vlm_model_name`` is unset (backward-compatible name).
+    - ``vlm_hf_model_class`` — ``auto`` (default), ``image_text_to_text``, or ``vision2seq``; see
+      ``_load_vlm_ocr_v2_model_and_processor``.
     """
     global REWARDS_DICT
     if float(reward_min) > float(reward_max):
         raise ValueError("VLMOCRScoreV2: reward_min must be <= reward_max.")
+
+    resolved_model_id = _vlm_ocr_v2_resolve_model_id(
+        vlm_model_name=vlm_model_name,
+        qwen_model_name=qwen_model_name,
+        default="Qwen/Qwen3-VL-2B-Instruct",
+    )
+    _vlm_preflight_gemma4_torch(resolved_model_id)
 
     dtype = qwen_hf_dtype
     if dtype is None:
@@ -2981,11 +3169,15 @@ def do_vlm_ocr_score_v2(
         else ("cuda:0" if torch.cuda.is_available() else "cpu")
     )
     device_map = qwen_hf_device_map if qwen_hf_device_map is not None else None
+    device_map, qwen_hf_max_memory = _coerce_device_map_and_max_memory_for_tp(
+        device_map, qwen_hf_max_memory, qwen_tp_plan, "VLMOCRScoreV2"
+    )
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
     cache_key = (
-        str(qwen_model_name),
+        str(resolved_model_id),
+        str(vlm_hf_model_class),
         str(hf_revision),
         str(dtype),
         str(target_device),
@@ -3000,7 +3192,6 @@ def do_vlm_ocr_score_v2(
     cached = REWARDS_DICT["VLMOCRScoreV2"]
     needs_reload = bool(qwen_force_reload) or cached is None or cached.get("cache_key") != cache_key
     if needs_reload:
-        AutoModelForImageTextToText, AutoProcessor = _import_qwen3_vl_hf()
         model_load_kw = dict(load_kw)
         model_load_kw["device_map"] = device_map
         model_load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
@@ -3013,24 +3204,18 @@ def do_vlm_ocr_score_v2(
             model_load_kw["tp_plan"] = qwen_tp_plan
         if qwen_attn_implementation is not None:
             model_load_kw["attn_implementation"] = qwen_attn_implementation
-        try:
-            model = AutoModelForImageTextToText.from_pretrained(
-                qwen_model_name,
-                torch_dtype=dtype,
-                **model_load_kw,
-            )
-        except TypeError:
-            model = AutoModelForImageTextToText.from_pretrained(
-                qwen_model_name,
-                dtype=dtype,
-                **model_load_kw,
-            )
+        model, processor = _load_vlm_ocr_v2_model_and_processor(
+            resolved_model_id,
+            dtype,
+            load_kw=load_kw,
+            model_load_kw=model_load_kw,
+            vlm_hf_model_class=str(vlm_hf_model_class or "auto"),
+        )
         if device_map is None:
             model = model.to(target_device)
         model.eval()
-        processor = AutoProcessor.from_pretrained(qwen_model_name, **load_kw)
         REWARDS_DICT["VLMOCRScoreV2"] = {
-            "model_name": qwen_model_name,
+            "model_name": resolved_model_id,
             "model": model,
             "processor": processor,
             "device": target_device,
@@ -3065,7 +3250,9 @@ def do_vlm_ocr_score_v2(
         if include_prompt_context and image_prompt:
             query_text = (
                 f"{query_text}\n"
-                "Judge text rendered in the image against TARGET_STRING_TO_MATCH."
+                "Score layout/quality fields based on the image. "
+                "Use REFERENCE_STRING_FOR_METRICS only to judge completeness/coverage vs what you transcribed — "
+                "not to invent transcription."
             )
 
         messages = [
@@ -3206,7 +3393,7 @@ def do_vlm_ocr_score_v2(
         if qwen_debug_print:
             print(
                 "[VLMOCRScoreV2] "
-                f"idx={i} target_text={per_image_target_text!r} reward={reward:.5f} "
+                f"model={resolved_model_id!r} idx={i} target_text={per_image_target_text!r} reward={reward:.5f} "
                 f"detected={meta.get('detected_text', '')!r} raw_answer={answer[:220]!r}"
             )
         rewards.append(float(reward))
@@ -3215,9 +3402,23 @@ def do_vlm_ocr_score_v2(
             log_parent = os.path.dirname(effective_log_path)
             if log_parent:
                 os.makedirs(log_parent, exist_ok=True)
+            inter_path = None
+            if (
+                debug_intermediate_images_dir
+                and debug_sampling_idx is not None
+            ):
+                inter_path = os.path.join(
+                    str(debug_intermediate_images_dir),
+                    f"step_{int(debug_sampling_idx):04d}",
+                    f"particle_{int(i):02d}.png",
+                )
             rec = {
                 "sampling_idx": int(debug_sampling_idx) if debug_sampling_idx is not None else None,
                 "particle_idx": int(i),
+                "vlm_model_id": str(resolved_model_id),
+                "vlm_hf_model_class": str(vlm_hf_model_class or "auto"),
+                "qwen_model_name": str(resolved_model_id),
+                "intermediate_image_path": inter_path,
                 "target_text": str(per_image_target_text),
                 "target_string_to_match": str(per_image_target_text),
                 "generation_context": generation_context,
@@ -3298,6 +3499,9 @@ def do_qwen3_vl_style_reward(
     device_map = qwen_hf_device_map
     if device_map is None:
         device_map = None
+    device_map, qwen_hf_max_memory = _coerce_device_map_and_max_memory_for_tp(
+        device_map, qwen_hf_max_memory, qwen_tp_plan, "Qwen3VLStyle"
+    )
     # Reload when model-loading parameters change so notebook config edits are honored.
     cache_key = (
         str(qwen_model_name),
