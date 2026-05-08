@@ -154,11 +154,23 @@ def parse_args() -> argparse.Namespace:
         "--vlm-hf-model-class",
         type=str,
         default="auto",
-        choices=("auto", "image_text_to_text", "vision2seq"),
+        choices=("auto", "image_text_to_text", "vision2seq", "auto_model"),
         help=(
-            "Which Transformers auto class to load for ``--vlm-model-name`` / VLMOCRScoreV2. "
-            "``auto`` tries ``AutoModelForImageTextToText`` then ``AutoModelForVision2Seq``. "
-            "Gemma 4 / Qwen3-VL typically need ``auto`` or ``image_text_to_text``."
+            "Which Transformers class to load for ``--vlm-model-name`` / VLMOCRScoreV2. "
+            "``auto`` tries ImageTextToText, then ``AutoModel`` (InternVL remote code), then Vision2Seq. "
+            "OpenGVLab InternVL2.x often needs ``auto`` or ``auto_model``. "
+            "Gemma / Qwen3-VL: ``auto`` or ``image_text_to_text``."
+        ),
+    )
+    parser.add_argument(
+        "--vlm-trust-remote-code",
+        dest="vlm_trust_remote_code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pass ``trust_remote_code`` when loading HF VLMs (model + processor). "
+            "Required for OpenGVLab/InternVL and other repos with custom modeling code; avoids interactive prompts. "
+            "Use ``--no-vlm-trust-remote-code`` to disallow remote code."
         ),
     )
     parser.add_argument(
@@ -756,6 +768,9 @@ def main() -> None:
                     vhc = (getattr(args, "vlm_hf_model_class", None) or "").strip()
                     if vhc:
                         reward_config["vlm_hf_model_class"] = vhc
+                    reward_config["qwen_trust_remote_code"] = bool(
+                        getattr(args, "vlm_trust_remote_code", True)
+                    )
                     if (
                         guidance_reward_fn == "VLMOCRScoreV2"
                         and getattr(args, "vlm_ocr_log_include_model_slug", False)

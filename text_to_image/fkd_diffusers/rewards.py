@@ -1453,6 +1453,59 @@ def _torch_version_tuple() -> tuple:
         return (0, 0, 0)
 
 
+def _transformers_version_tuple() -> tuple:
+    """Parse installed ``transformers.__version__`` as ``(major, minor, patch)``."""
+    try:
+        import transformers as tf_mod
+
+        s = str(tf_mod.__version__).split("+")[0].strip()
+        parts = []
+        for seg in s.split(".")[:3]:
+            m = re.match(r"^(\d+)", seg)
+            if m:
+                parts.append(int(m.group(1)))
+            else:
+                break
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _vlm_preflight_internvl_transformers(model_id: str) -> None:
+    """
+    OpenGVLab InternVL2.x uses remote ``InternVLChatModel`` code that tracks **transformers 4.x**.
+
+    - **Too old (e.g. 4.38):** missing ``PreTrainedModel`` APIs.
+    - **transformers 5+:** often hits ``InternVLChatModel`` / ``all_tied_weights_keys`` or load-path
+      mismatches with the hub snapshot; use **4.46–4.48** until the hub is updated.
+    """
+    if "internvl" not in str(model_id).lower():
+        return
+    t = _transformers_version_tuple()
+    try:
+        import transformers as tf_mod
+
+        ver = tf_mod.__version__
+    except Exception:
+        ver = "unknown"
+    if t < (4, 45, 0):
+        raise RuntimeError(
+            "VLMOCRScoreV2: OpenGVLab InternVL needs transformers>=4.45. "
+            f"Your transformers is {ver}. "
+            "Fix: pip install -U 'transformers>=4.46,<5' 'tokenizers>=0.20.0'"
+        )
+    if t >= (5, 0, 0):
+        raise RuntimeError(
+            "VLMOCRScoreV2: OpenGVLab InternVL2.x remote code is not reliably compatible with "
+            "transformers v5+ yet (common failure: InternVLChatModel / tied weights / "
+            "`all_tied_weights_keys` during load). "
+            f"Your transformers is {ver}. "
+            "Pin transformers 4.x, e.g.: pip install 'transformers>=4.46,<5' 'tokenizers>=0.20,<1' --force-reinstall"
+        )
+
+
 def _vlm_preflight_gemma4_torch(model_id: str) -> None:
     """
     Gemma 4 in recent ``transformers`` uses sliding-window attention helpers that require
@@ -1472,12 +1525,14 @@ def _vlm_preflight_gemma4_torch(model_id: str) -> None:
 
 
 def _vlm_ocr_v2_from_pretrained(model_cls, model_id: str, dtype, model_load_kw: dict):
+    kw = dict(model_load_kw)
     try:
-        return model_cls.from_pretrained(
-            model_id, torch_dtype=dtype, **model_load_kw
-        )
+        return model_cls.from_pretrained(model_id, dtype=dtype, **kw)
     except TypeError:
-        return model_cls.from_pretrained(model_id, dtype=dtype, **model_load_kw)
+        try:
+            return model_cls.from_pretrained(model_id, torch_dtype=dtype, **kw)
+        except TypeError:
+            return model_cls.from_pretrained(model_id, **kw)
 
 
 def _load_vlm_ocr_v2_model_and_processor(
@@ -1492,10 +1547,11 @@ def _load_vlm_ocr_v2_model_and_processor(
     Load a vision–language model for ``VLMOCRScoreV2``.
 
     ``vlm_hf_model_class``:
-    - ``auto`` — try ``AutoModelForImageTextToText`` (Qwen3-VL, Gemma 4, …), then
-      ``AutoModelForVision2Seq`` as a fallback for older stacks.
+    - ``auto`` — try ``AutoModelForImageTextToText``, then ``AutoModel`` (InternVL / remote-code repos),
+      then ``AutoModelForVision2Seq`` when available in your ``transformers`` build.
     - ``image_text_to_text`` / ``itt`` — only ``AutoModelForImageTextToText``
-    - ``vision2seq`` / ``v2s`` — only ``AutoModelForVision2Seq``
+    - ``auto_model`` — only ``AutoModel`` (OpenGVLab InternVL2.x chat checkpoints use ``InternVLChatConfig``).
+    - ``vision2seq`` / ``v2s`` — only ``AutoModelForVision2Seq`` (not present in older ``transformers``).
     """
     from transformers import AutoProcessor
 
@@ -1510,33 +1566,83 @@ def _load_vlm_ocr_v2_model_and_processor(
             AutoModelForImageTextToText, model_id, dtype, model_load_kw
         )
 
+    def _try_auto_model():
+        """Generic HF loader for custom configs (e.g. InternVLChatConfig + remote modeling code)."""
+        from transformers import AutoModel
+
+        try:
+            return _vlm_ocr_v2_from_pretrained(AutoModel, model_id, dtype, model_load_kw)
+        except AttributeError as e:
+            if (
+                "all_tied_weights_keys" not in str(e)
+                or "internvl" not in str(model_id).lower()
+            ):
+                raise
+            kw = dict(model_load_kw)
+            kw["low_cpu_mem_usage"] = False
+            return _vlm_ocr_v2_from_pretrained(AutoModel, model_id, dtype, kw)
+
     def _try_vis2seq():
-        from transformers import AutoModelForVision2Seq
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError as e:
+            raise ImportError(
+                "AutoModelForVision2Seq is not available in this transformers version"
+            ) from e
 
         return _vlm_ocr_v2_from_pretrained(
             AutoModelForVision2Seq, model_id, dtype, model_load_kw
         )
 
     model = None
-    if choice in ("auto", "", "image_text_to_text", "itt"):
+    is_internvl = "internvl" in str(model_id).lower()
+
+    # For InternVL, try AutoModel first (correct entrypoint); ITT always fails on InternVLChatConfig.
+    if choice in ("auto", ""):
+        if is_internvl:
+            try_chain = (
+                (_try_auto_model, "AutoModel"),
+                (_try_img_txt, "AutoModelForImageTextToText"),
+                (_try_vis2seq, "AutoModelForVision2Seq"),
+            )
+        else:
+            try_chain = (
+                (_try_img_txt, "AutoModelForImageTextToText"),
+                (_try_auto_model, "AutoModel"),
+                (_try_vis2seq, "AutoModelForVision2Seq"),
+            )
+        for fn, label in try_chain:
+            if model is not None:
+                break
+            try:
+                model = fn()
+            except Exception as e:
+                errs.append((label, e))
+
+    elif choice in ("image_text_to_text", "itt"):
         try:
             model = _try_img_txt()
         except Exception as e:
             errs.append(("AutoModelForImageTextToText", e))
-            if choice in ("image_text_to_text", "itt"):
-                raise RuntimeError(
-                    f"VLMOCRScoreV2: AutoModelForImageTextToText failed for {model_id!r}"
-                ) from e
+            raise RuntimeError(
+                f"VLMOCRScoreV2: AutoModelForImageTextToText failed for {model_id!r}"
+            ) from e
 
-    if model is None and choice in ("auto", "", "vision2seq", "v2s"):
+    elif choice == "auto_model":
+        try:
+            model = _try_auto_model()
+        except Exception as e:
+            errs.append(("AutoModel", e))
+            raise RuntimeError(f"VLMOCRScoreV2: AutoModel failed for {model_id!r}") from e
+
+    elif choice in ("vision2seq", "v2s"):
         try:
             model = _try_vis2seq()
         except Exception as e:
             errs.append(("AutoModelForVision2Seq", e))
-            if choice in ("vision2seq", "v2s"):
-                raise RuntimeError(
-                    f"VLMOCRScoreV2: AutoModelForVision2Seq failed for {model_id!r}"
-                ) from e
+            raise RuntimeError(
+                f"VLMOCRScoreV2: AutoModelForVision2Seq failed for {model_id!r}"
+            ) from e
 
     if model is None:
         msg = (
@@ -3146,7 +3252,7 @@ def do_vlm_ocr_score_v2(
     Model selection:
     - ``vlm_model_name`` — preferred HF model id for this reward (e.g. ``google/gemma-4-26B-A4B-it``).
     - ``qwen_model_name`` — fallback id when ``vlm_model_name`` is unset (backward-compatible name).
-    - ``vlm_hf_model_class`` — ``auto`` (default), ``image_text_to_text``, or ``vision2seq``; see
+    - ``vlm_hf_model_class`` — ``auto`` (default), ``image_text_to_text``, ``auto_model``, or ``vision2seq``; see
       ``_load_vlm_ocr_v2_model_and_processor``.
     """
     global REWARDS_DICT
@@ -3159,6 +3265,7 @@ def do_vlm_ocr_score_v2(
         default="Qwen/Qwen3-VL-2B-Instruct",
     )
     _vlm_preflight_gemma4_torch(resolved_model_id)
+    _vlm_preflight_internvl_transformers(resolved_model_id)
 
     dtype = qwen_hf_dtype
     if dtype is None:
@@ -3175,6 +3282,9 @@ def do_vlm_ocr_score_v2(
     load_kw = {}
     if hf_revision is not None:
         load_kw["revision"] = hf_revision
+    # Processor.from_pretrained also needs this for repos with custom code (e.g. InternVL); model_load_kw
+    # alone still triggers an interactive HF prompt on the processor load path.
+    load_kw["trust_remote_code"] = bool(qwen_trust_remote_code)
     cache_key = (
         str(resolved_model_id),
         str(vlm_hf_model_class),
